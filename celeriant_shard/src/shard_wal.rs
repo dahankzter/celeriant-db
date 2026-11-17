@@ -588,6 +588,38 @@ fn summary_hint(payload: &SegmentSummaryPayload, key: &AggregateKey, client_hash
     (entry.newest_metablock_pos != 0).then_some(SegmentHint::SeekTo(entry.newest_metablock_pos))
 }
 
+/// Position of the first metablock in `[header end, metablocks_end)` with a `wal_seq`
+/// past `after_wal_seq`, or `metablocks_end`. Metablocks are fixed-size and `wal_seq`
+/// ascends with position within a segment, compacted or not, so this binary search
+/// reads one block per probe instead of the whole prefix.
+async fn first_metablock_after(
+    dma_file: &glommio::io::DmaFile,
+    log_id: u64,
+    metablocks_end: u64,
+    after_wal_seq: u64,
+) -> Result<u64, ScanError<DiskFormatError>> {
+    let metablocks_start = HEADER_BLOCK_SIZE_BYTES as u64;
+    let block_size = FIXED_BLOCK_SIZE_BYTES as u64;
+    let (mut low, mut high) = (0, (metablocks_end - metablocks_start) / block_size);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let pos = metablocks_start + mid * block_size;
+        let block = dma_file
+            .read_at(pos, FIXED_BLOCK_SIZE_BYTES)
+            .await
+            .map_err(|e| ScanError::Io { log_id, source: e.to_string() })?;
+        if block.len() < FIXED_BLOCK_SIZE_BYTES {
+            return Err(ScanError::ShortRead { log_id, pos, requested: FIXED_BLOCK_SIZE_BYTES, got: block.len() });
+        }
+        if metablock_bytes::read_wal_seq(&block) > after_wal_seq {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    Ok(metablocks_start + low * block_size)
+}
+
 impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     pub async fn process_client_request(&self, request: ClientRequest) -> Result<ClientResponse, ShardError> {
         let shard_label = &self.metrics_shard_label;
@@ -2142,13 +2174,13 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         // Lowest segment whose header wal_seq is past the cursor. Header wal_seqs never
         // decrease with log_id: rotation carries the predecessor's forward and compaction
         // keeps the original, so empty and compacted segments need no special case.
-        let (mut log_id, mut upper) = (1, active_log_id);
-        while log_id < upper {
-            let mid = log_id + (upper - log_id) / 2;
+        let (mut start_log_id, mut upper) = (1, active_log_id);
+        while start_log_id < upper {
+            let mid = start_log_id + (upper - start_log_id) / 2;
             if self.log_segments_cache.get(mid).await?.metadata.borrow().write.wal_seq > after_wal_seq {
                 upper = mid;
             } else {
-                log_id = mid + 1;
+                start_log_id = mid + 1;
             }
         }
 
@@ -2157,61 +2189,72 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         let mut examined_wal_seq = after_wal_seq;
         // Some(read_wal_seq) once the scan stops.
         let mut stopped_at: Option<u64> = None;
-        while stopped_at.is_none() && log_id <= active_log_id {
+        for log_id in start_log_id..=active_log_id {
             let log_segment = self.log_segments_cache.get(log_id).await?;
             // Scan to the write cursor: a sealed segment can hold a committed tail above
             // its own read cursor (see fetch_catchup_entries). `tip` bounds visibility.
-            let metablocks_start = HEADER_BLOCK_SIZE_BYTES as u64;
             let metablocks_end = log_segment.metadata.borrow().write.metablocks_position;
-            if metablocks_end > metablocks_start {
-                let guard = log_segment.lock_reader("tail_shard").await?;
-                let dma_file = guard.as_ref().ok_or(ScanError::NoFileHandle { log_id })?;
-                read_fixed_records_visit_const::<FIXED_BLOCK_SIZE_BYTES, DiskFormatError>(
-                    dma_file,
-                    false,
-                    metablocks_start,
-                    metablocks_end,
-                    SCAN_CHUNK_SIZE,
-                    |_pos, bytes| {
-                        let wal_seq = metablock_bytes::read_wal_seq(bytes);
-                        if wal_seq <= after_wal_seq {
-                            return Ok(false);
-                        }
-                        if wal_seq > tip {
-                            stopped_at = Some(tip);
-                            return Ok(true);
-                        }
-                        // Past the first entry, so every call advances read_wal_seq.
-                        if examined > 0 && (examined >= self.config.list_page_size || started.elapsed() >= self.config.list_max_duration) {
+            if metablocks_end <= HEADER_BLOCK_SIZE_BYTES as u64 {
+                continue;
+            }
+            let guard = log_segment.lock_reader("tail_shard").await?;
+            let dma_file = guard.as_ref().ok_or(ScanError::NoFileHandle { log_id })?;
+            // Only the start segment holds wal_seqs at or below the cursor.
+            let metablocks_start = if log_id == start_log_id {
+                first_metablock_after(dma_file, log_id, metablocks_end, after_wal_seq).await?
+            } else {
+                HEADER_BLOCK_SIZE_BYTES as u64
+            };
+            if metablocks_start == metablocks_end {
+                continue;
+            }
+            read_fixed_records_visit_const::<FIXED_BLOCK_SIZE_BYTES, DiskFormatError>(
+                dma_file,
+                false,
+                metablocks_start,
+                metablocks_end,
+                SCAN_CHUNK_SIZE,
+                |_pos, bytes| {
+                    let wal_seq = metablock_bytes::read_wal_seq(bytes);
+                    if wal_seq <= after_wal_seq {
+                        return Ok(false);
+                    }
+                    if wal_seq > tip {
+                        stopped_at = Some(tip);
+                        return Ok(true);
+                    }
+                    // Past the first entry, so every call advances read_wal_seq.
+                    if examined > 0 && (examined >= self.config.list_page_size || started.elapsed() >= self.config.list_max_duration) {
+                        stopped_at = Some(examined_wal_seq);
+                        return Ok(true);
+                    }
+                    // Schema registrations carry no aggregate key and are not tailed.
+                    let wanted = metablock_bytes::read_chain_aggregate_key(bytes)
+                        .is_some_and(|key| request.orgs.as_ref().is_none_or(|orgs| orgs.contains(&key.org_id)));
+                    if wanted {
+                        let size_estimate = metablock_bytes::read_uncompressed_size(bytes).saturating_add(FIXED_BLOCK_SIZE_BYTES as u64);
+                        // Not examined: the consumer must see this entry on its next call.
+                        if !kept.is_empty() && accumulated_size.saturating_add(size_estimate) > max_bytes {
                             stopped_at = Some(examined_wal_seq);
                             return Ok(true);
                         }
-                        // Schema registrations carry no aggregate key and are not tailed.
-                        let wanted = metablock_bytes::read_chain_aggregate_key(bytes)
-                            .is_some_and(|key| request.orgs.as_ref().is_none_or(|orgs| orgs.contains(&key.org_id)));
-                        if wanted {
-                            let size_estimate = metablock_bytes::read_uncompressed_size(bytes).saturating_add(FIXED_BLOCK_SIZE_BYTES as u64);
-                            // Not examined: the consumer must see this entry on its next call.
-                            if !kept.is_empty() && accumulated_size.saturating_add(size_estimate) > max_bytes {
-                                stopped_at = Some(examined_wal_seq);
-                                return Ok(true);
-                            }
-                            accumulated_size += size_estimate;
-                            kept.push(EventBatchFromLogSegmentFile { log_id, metablock: deserialise_metablock(bytes)?, datablock: None });
-                        }
-                        examined += 1;
-                        examined_wal_seq = wal_seq;
-                        Ok(false)
-                    },
-                )
-                .await
-                .map_err(|e| match e {
-                    ReadVisitError::Io(source) => ScanError::Io { log_id, source: source.to_string() },
-                    ReadVisitError::ShortRead { pos, requested, got } => ScanError::ShortRead { log_id, pos, requested, got },
-                    ReadVisitError::Visitor(e) => ScanError::Visitor(e),
-                })?;
+                        accumulated_size += size_estimate;
+                        kept.push(EventBatchFromLogSegmentFile { log_id, metablock: deserialise_metablock(bytes)?, datablock: None });
+                    }
+                    examined += 1;
+                    examined_wal_seq = wal_seq;
+                    Ok(false)
+                },
+            )
+            .await
+            .map_err(|e| match e {
+                ReadVisitError::Io(source) => ScanError::Io { log_id, source: source.to_string() },
+                ReadVisitError::ShortRead { pos, requested, got } => ScanError::ShortRead { log_id, pos, requested, got },
+                ReadVisitError::Visitor(e) => ScanError::Visitor(e),
+            })?;
+            if stopped_at.is_some() {
+                break;
             }
-            log_id += 1;
         }
 
         Ok(stopped_at.unwrap_or(tip))
@@ -14623,6 +14666,11 @@ use celeriant_wal::segment_summary::segment_aggregate_entry::SegmentAggregateEnt
         }
     }
 
+    /// `wal_seq` of the first entry a tail from `cursor` returns.
+    async fn first_after<R: ReplicationClient, D: S3Downloader>(shard: &ShardWal<R, D>, cursor: u64) -> Option<u64> {
+        shard.tail_shard(tail_req(cursor, 1, None)).await.unwrap().entries.first().map(|e| e.wal_seq)
+    }
+
     #[test]
     fn tail_empty_shard_returns_no_entries() {
         glommio_test!({
@@ -14862,6 +14910,41 @@ use celeriant_wal::segment_summary::segment_aggregate_entry::SegmentAggregateEnt
             );
             assert!(entries.iter().any(|e| matches!(&e.kind, TailEntryKind::Delete(d) if d.aggregate_key == agg_a)));
             assert!(entries.iter().any(|e| matches!(&e.kind, TailEntryKind::Events { aggregate_key, batch } if *aggregate_key == agg_b && batch.events.len() == 3)));
+
+            // Every cursor, including those inside the compaction gap, resumes at the
+            // smallest surviving wal_seq past it.
+            for cursor in 0..tip {
+                let expected = seqs.iter().copied().find(|&s| s > cursor);
+                assert_eq!(first_after(&shard, cursor).await, expected, "cursor {cursor}");
+            }
+
+            shard.close().await;
+        });
+    }
+
+    /// Wherever the cursor sits in a segment, the first entry returned is the smallest
+    /// wal_seq past it, and finding it costs O(log n) block reads plus the page.
+    #[test]
+    fn tail_seek_within_segment() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let writes: HashMap<AggregateKey, SingleAggregateWrite> = (1..=2000)
+                .map(|id| (key(1, 1, id), SingleAggregateWrite { events: events(1), allow_create: true, expected_version: None, enforce_client_idempotency: false }))
+                .collect();
+            write_ok(&shard, ClientRequest::Write(WriteRequest { correlation_id: None, client_id: 1, user_id: None, writes })).await;
+            assert_eq!(shard.log_segments_cache.active_log_id(), 1, "scaffolding: one segment");
+            let tip = shard.log_segments_cache.get_latest_read_cursor_wal_seq();
+            assert_eq!(tip, 2000);
+            let max_reads = u64::from(u64::BITS - tip.leading_zeros()) + 2;
+
+            for cursor in [0, 1, tip / 2, tip - 1, tip] {
+                glommio::executor().io_stats();
+                let first = first_after(&shard, cursor).await;
+                let reads = glommio::executor().io_stats().all_rings().file_reads().0;
+                assert_eq!(first, (cursor < tip).then_some(cursor + 1), "cursor {cursor}");
+                assert!(reads <= max_reads, "cursor {cursor}: {reads} reads, expected at most {max_reads}");
+            }
 
             shard.close().await;
         });
