@@ -1,4 +1,4 @@
-use crate::error::{follower_replication_write_error::FollowerReplicationWriteError, shard_delete_error::ShardDeleteError, shard_exists_error::ShardAggregateDetailsError, shard_listing_error::ShardListingError, shard_read_error::ShardReadError, shard_schema_error::ShardSchemaError, shard_trim_error::ShardTrimError, shard_write_error::ShardWriteError};
+use crate::error::{follower_replication_write_error::FollowerReplicationWriteError, shard_delete_error::ShardDeleteError, shard_exists_error::ShardAggregateDetailsError, shard_listing_error::ShardListingError, shard_read_error::ShardReadError, shard_schema_error::ShardSchemaError, shard_tail_error::ShardTailError, shard_trim_error::ShardTrimError, shard_write_error::ShardWriteError};
 
 #[derive(Debug, Clone)]
 pub enum ShardError {
@@ -13,6 +13,7 @@ pub enum ShardError {
     ListOrgs(ShardListingError),
     AggregateDetails(ShardAggregateDetailsError),
     RegisterSchema(ShardSchemaError),
+    TailShard(ShardTailError),
 }
 
 impl ShardError {
@@ -29,6 +30,7 @@ impl ShardError {
             Self::ListOrgs(e) => e.error_code(),
             Self::AggregateDetails(e) => e.error_code(),
             Self::RegisterSchema(e) => e.error_code(),
+            Self::TailShard(e) => e.error_code(),
         }
     }
 }

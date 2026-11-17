@@ -7,6 +7,7 @@ use celeriant_wal::segment_summary::segment_summary_payload::SegmentSummaryPaylo
 use glommio::sync::Semaphore;
 use tracing::{debug, info, trace, warn};
 
+use celeriant_disk::files::read_fixed_records_visit_const::{read_fixed_records_visit_const, ReadVisitError};
 use celeriant_disk::files::rwlock_timeout::write_with_timeout;
 use celeriant_distributed::node_status::NodeStatus;
 use celeriant_distributed::validated_node_status::{self, ValidatedNodeStatus, set_node_status_and_metric};
@@ -30,9 +31,9 @@ type MemCache = ShardMemCache<CompiledValidator>;
 use celeriant_msg::process_client_requests::ClientRequest;
 use celeriant_msg::process_client_responses::ClientResponse;
 use celeriant_msg::request::read_filters::ReadFilters;
-use celeriant_msg::request::requests::{DeleteRequest, AggregateDetailsRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest, SingleAggregateWrite, TrimStartRequest, WriteRequest};
+use celeriant_msg::request::requests::{DeleteRequest, AggregateDetailsRequest, ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest, ReadRequest, SingleAggregateWrite, TailShardRequest, TrimStartRequest, WriteRequest};
 use celeriant_msg::response::aggregate_event_batch::AggregateEventBatch;
-use celeriant_msg::response::responses::{AggregateConflict, conflict_response_reservation, AggregateListItem, AggregateTypeListItem, AggregateDetailsResponse, DeleteResponse, FollowerRejection, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, OrgListItem, ReadResponse, RegisterSchemaResponse, ReplicationBatchResponse, ReplicationResult, TrimStartResponse, WriteResponse};
+use celeriant_msg::response::responses::{AggregateConflict, conflict_response_reservation, AggregateListItem, AggregateTypeListItem, AggregateDetailsResponse, DeleteResponse, FollowerRejection, ListAggregateTypesResponse, ListAggregatesResponse, ListOrgsResponse, OrgListItem, ReadResponse, RegisterSchemaResponse, ReplicationBatchResponse, ReplicationResult, TailEntry, TailEntryKind, TailShardResponse, TrimStartResponse, WriteResponse};
 use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_rotating_log::reverse_metablock_scanner::{ReverseMetablockScanner, SegmentHint};
 use lru::LruCache;
@@ -41,7 +42,7 @@ use celeriant_wal::aggregate_client_key::{client_id_bloom_hash, AggregateClientK
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::aggregate_type_key::AggregateTypeKey;
 use celeriant_wal::schema_key::SchemaKey;
-use celeriant_wal::constants::{FIRST_AGGREGATE_VERSION, FIXED_BLOCK_SIZE_BYTES, GENESIS_HASH};
+use celeriant_wal::constants::{FIRST_AGGREGATE_VERSION, FIXED_BLOCK_SIZE_BYTES, GENESIS_HASH, HEADER_BLOCK_SIZE_BYTES};
 use celeriant_wal::datablocks::datablock::Datablock;
 use celeriant_wal::datablocks::datablock_aggregate_event_batch::DatablockAggregateEventBatch;
 use celeriant_wal::datablocks::datablock_kind::DatablockKind;
@@ -72,6 +73,7 @@ use crate::error::shard_fsync_error::ShardFsyncError;
 use crate::error::shard_listing_error::ShardListingError;
 use crate::error::shard_read_error::ShardReadError;
 use crate::error::shard_schema_error::ShardSchemaError;
+use crate::error::shard_tail_error::ShardTailError;
 use crate::error::shard_trim_error::ShardTrimError;
 use crate::error::shard_write_error::ShardWriteError;
 use crate::in_memory_filtering;
@@ -79,7 +81,7 @@ use crate::internal_shard_config::InternalShardConfig;
 use crate::loading_coordinator::LoadingCoordinator;
 use crate::replication_client::ReplicationClient;
 use crate::s3_downloader::S3Downloader;
-use crate::shard_wal_compact::{CompactionResult, compact_segment};
+use crate::shard_wal_compact::{CompactionResult, SCAN_CHUNK_SIZE, compact_segment};
 use crate::error::compaction_error::CompactionError;
 use crate::shard_wal_replicate::{self, capture_replication_snapshot, commit_replication, wal_positions, ReplicationTrigger};
 use crate::shard_wal_s3_catchup::{self, S3CatchupResult, catchup_from_s3};
@@ -598,7 +600,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             ClientRequest::TrimStart(r) => ("trim", self.trim_start(r).await.map(ClientResponse::TrimStart).map_err(ShardError::TrimStart)),
             ClientRequest::AggregateDetails(r) => ("exists", self.exists(&r).await.map(ClientResponse::AggregateDetails).map_err(ShardError::AggregateDetails)),
             ClientRequest::Watch(_) => return Err(ShardError::WatchRequestInvalid),
-            ClientRequest::TailShard(_) => return Err(ShardError::WatchRequestInvalid),
+            ClientRequest::TailShard(r) => ("tail_shard", self.tail_shard(r).await.map(ClientResponse::TailShard).map_err(ShardError::TailShard)),
             ClientRequest::ListOrgs(r) => ("list_orgs", self.list_orgs(r).await.map(ClientResponse::ListOrgs).map_err(ShardError::ListOrgs)),
             ClientRequest::ListAggregateTypes(r) => ("list_aggregate_types", self.list_aggregate_types(r).await.map(ClientResponse::ListAggregateTypes).map_err(ShardError::ListAggregateTypes)),
             ClientRequest::ListAggregates(r) => ("list_aggregates", self.list_aggregates(r).await.map(ClientResponse::ListAggregates).map_err(ShardError::ListAggregates)),
@@ -2079,6 +2081,126 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             event_batches,
             next_aggregate_version: collection.next_aggregate_version,
         })
+    }
+
+    /// WAL entries after `after_wal_seq`, ascending, up to the shard read cursor so a
+    /// rollback can never retract one. Bounded by `min(max_bytes, max_response_size)`,
+    /// except that one entry is always returned when available so the consumer progresses.
+    pub async fn tail_shard(&self, request: TailShardRequest) -> Result<TailShardResponse, ShardTailError> {
+        let tip = self.log_segments_cache.get_latest_read_cursor_wal_seq();
+        if request.after_wal_seq > tip {
+            return Err(ShardTailError::TailCursorAhead { tip_wal_seq: tip });
+        }
+
+        let mut kept: Vec<EventBatchFromLogSegmentFile> = Vec::new();
+        if request.after_wal_seq < tip {
+            self.collect_tail_metablocks(&request, tip, &mut kept).await?;
+        }
+        fetch_datablocks_for_metablocks(&mut kept, self.config.read_max_chunk_size, &self.log_segments_cache, &self.dict_codec).await?;
+
+        let mut entries = Vec::with_capacity(kept.len());
+        for EventBatchFromLogSegmentFile { metablock, datablock, .. } in kept {
+            let kind = match metablock.wal_metablock_type {
+                MetablockKind::EventBatchMetadata(ref event_batch) => {
+                    let Some(batch) = datablock.as_ref().and_then(|d| AggregateEventBatch::from_wal(&metablock, d)) else {
+                        continue;
+                    };
+                    TailEntryKind::Events { aggregate_key: event_batch.aggregate_key.clone(), batch }
+                }
+                MetablockKind::SoftDelete(soft_delete) => TailEntryKind::Delete(soft_delete),
+                MetablockKind::SoftTrim(soft_trim) => TailEntryKind::Trim(soft_trim),
+                MetablockKind::SchemaRegistration(_) => continue,
+            };
+            entries.push(TailEntry { wal_seq: metablock.wal_seq, server_timestamp: metablock.server_timestamp, kind });
+        }
+
+        Ok(TailShardResponse {
+            correlation_id: request.correlation_id,
+            shard_id: request.shard_id,
+            entries,
+            read_wal_seq: tip,
+        })
+    }
+
+    /// Forward metablock scan for `tail_shard`, from the first segment holding a
+    /// `wal_seq` past the cursor up to `tip`.
+    async fn collect_tail_metablocks(
+        &self,
+        request: &TailShardRequest,
+        tip: u64,
+        kept: &mut Vec<EventBatchFromLogSegmentFile>,
+    ) -> Result<(), ScanError<DiskFormatError>> {
+        let after_wal_seq = request.after_wal_seq;
+        let max_bytes = (request.max_bytes as u64).min(self.config.max_response_size);
+        let active_log_id = self.log_segments_cache.active_log_id();
+
+        // Lowest segment whose header wal_seq is past the cursor. Header wal_seqs never
+        // decrease with log_id: rotation carries the predecessor's forward and compaction
+        // keeps the original, so empty and compacted segments need no special case.
+        let (mut log_id, mut upper) = (1, active_log_id);
+        while log_id < upper {
+            let mid = log_id + (upper - log_id) / 2;
+            if self.log_segments_cache.get(mid).await?.metadata.borrow().write.wal_seq > after_wal_seq {
+                upper = mid;
+            } else {
+                log_id = mid + 1;
+            }
+        }
+
+        let mut accumulated_size = 0u64;
+        let mut done = false;
+        while !done && log_id <= active_log_id {
+            let log_segment = self.log_segments_cache.get(log_id).await?;
+            // Scan to the write cursor: a sealed segment can hold a committed tail above
+            // its own read cursor (see fetch_catchup_entries). `tip` bounds visibility.
+            let metablocks_start = HEADER_BLOCK_SIZE_BYTES as u64;
+            let metablocks_end = log_segment.metadata.borrow().write.metablocks_position;
+            if metablocks_end > metablocks_start {
+                let guard = log_segment.lock_reader("tail_shard").await?;
+                let dma_file = guard.as_ref().ok_or(ScanError::NoFileHandle { log_id })?;
+                read_fixed_records_visit_const::<FIXED_BLOCK_SIZE_BYTES, DiskFormatError>(
+                    dma_file,
+                    false,
+                    metablocks_start,
+                    metablocks_end,
+                    SCAN_CHUNK_SIZE,
+                    |_pos, bytes| {
+                        let wal_seq = metablock_bytes::read_wal_seq(bytes);
+                        if wal_seq <= after_wal_seq {
+                            return Ok(false);
+                        }
+                        if wal_seq > tip {
+                            done = true;
+                            return Ok(true);
+                        }
+                        // Schema registrations carry no aggregate key and are not tailed.
+                        let Some(aggregate_key) = metablock_bytes::read_chain_aggregate_key(bytes) else {
+                            return Ok(false);
+                        };
+                        if request.orgs.as_ref().is_some_and(|orgs| !orgs.contains(&aggregate_key.org_id)) {
+                            return Ok(false);
+                        }
+                        let size_estimate = metablock_bytes::read_uncompressed_size(bytes).saturating_add(FIXED_BLOCK_SIZE_BYTES as u64);
+                        if !kept.is_empty() && accumulated_size.saturating_add(size_estimate) > max_bytes {
+                            done = true;
+                            return Ok(true);
+                        }
+                        accumulated_size += size_estimate;
+                        kept.push(EventBatchFromLogSegmentFile { log_id, metablock: deserialise_metablock(bytes)?, datablock: None });
+                        Ok(false)
+                    },
+                )
+                .await
+                .map_err(|e| match e {
+                    ReadVisitError::Io(source) => ScanError::Io { log_id, source: source.to_string() },
+                    ReadVisitError::ShortRead { pos, requested, got } => ScanError::ShortRead { log_id, pos, requested, got },
+                    ReadVisitError::Visitor(e) => ScanError::Visitor(e),
+                })?;
+            }
+            log_id += 1;
+        }
+
+        Ok(())
     }
 
     /// Close the shard WAL, flushing any pending writes.
@@ -14457,6 +14579,289 @@ use celeriant_wal::segment_summary::segment_aggregate_entry::SegmentAggregateEnt
                     "sealed-segment replay must be rejected, got {dup:?}",
                 );
             }
+
+            shard.close().await;
+        });
+    }
+
+    // ── TailShard ──
+
+    fn tail_req(after_wal_seq: u64, max_bytes: u32, orgs: Option<HashSet<u128>>) -> TailShardRequest {
+        TailShardRequest { correlation_id: None, shard_id: 1, after_wal_seq, max_bytes, wait_ms: 0, orgs }
+    }
+
+    fn wal_seqs(entries: &[TailEntry]) -> Vec<u64> {
+        entries.iter().map(|e| e.wal_seq).collect()
+    }
+
+    /// Pages the tail from the beginning until a response comes back empty.
+    async fn tail_all<R: ReplicationClient, D: S3Downloader>(shard: &ShardWal<R, D>, max_bytes: u32) -> Vec<TailEntry> {
+        let mut entries: Vec<TailEntry> = Vec::new();
+        loop {
+            let after_wal_seq = entries.last().map_or(0, |e| e.wal_seq);
+            let page = shard.tail_shard(tail_req(after_wal_seq, max_bytes, None)).await.unwrap();
+            if page.entries.is_empty() {
+                return entries;
+            }
+            entries.extend(page.entries);
+        }
+    }
+
+    #[test]
+    fn tail_empty_shard_returns_no_entries() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+
+            let response = match process(&shard, ClientRequest::TailShard(tail_req(0, u32::MAX, None))).await {
+                Ok(ClientResponse::TailShard(r)) => r,
+                other => panic!("expected TailShard, got {other:?}"),
+            };
+            assert!(response.entries.is_empty());
+            assert_eq!(response.read_wal_seq, 0);
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn tail_returns_entries_in_wal_order() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            for agg in [key(1, 1, 1), key(1, 1, 2), key(1, 1, 1)] {
+                write_ok(&shard, write_req(agg, events(2))).await;
+            }
+
+            let response = shard.tail_shard(tail_req(0, u32::MAX, None)).await.unwrap();
+            let seqs = wal_seqs(&response.entries);
+            assert_eq!(seqs.len(), 3);
+            assert!(seqs.windows(2).all(|w| w[0] < w[1]), "wal_seq must strictly ascend: {seqs:?}");
+            let batches: Vec<(u128, u64, usize)> = response.entries.iter().map(|e| match &e.kind {
+                TailEntryKind::Events { aggregate_key, batch } => (aggregate_key.aggregate_id, batch.aggregate_version, batch.events.len()),
+                other => panic!("expected Events, got {other:?}"),
+            }).collect();
+            assert_eq!(batches, [(1, 1, 2), (2, 1, 2), (1, 2, 2)]);
+            assert_eq!(response.read_wal_seq, seqs[2]);
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn tail_after_cursor_is_exclusive() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            for id in 1..=3 {
+                write_ok(&shard, write_req(key(1, 1, id), events(1))).await;
+            }
+
+            let all = shard.tail_shard(tail_req(0, u32::MAX, None)).await.unwrap().entries;
+            let rest = shard.tail_shard(tail_req(all[0].wal_seq, u32::MAX, None)).await.unwrap().entries;
+            assert_eq!(wal_seqs(&rest), wal_seqs(&all[1..]));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn tail_max_bytes_cuts_at_entry_boundary() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            for id in 1..=5 {
+                write_ok(&shard, write_req(key(1, 1, id), events(2))).await;
+            }
+
+            let all = wal_seqs(&shard.tail_shard(tail_req(0, u32::MAX, None)).await.unwrap().entries);
+            assert_eq!(all.len(), 5);
+
+            let mut paged: Vec<u64> = Vec::new();
+            loop {
+                let after_wal_seq = paged.last().copied().unwrap_or(0);
+                let page = shard.tail_shard(tail_req(after_wal_seq, 1, None)).await.unwrap();
+                if page.entries.is_empty() {
+                    break;
+                }
+                assert_eq!(page.entries.len(), 1, "an entry over max_bytes is still returned, alone");
+                paged.push(page.entries[0].wal_seq);
+            }
+            assert_eq!(paged, all, "paging must yield every entry exactly once");
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn tail_includes_delete_and_trim() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            let agg = key(1, 1, 1);
+            // Trim validation needs keep_from <= the current version, so write two appends.
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+            assert!(matches!(process(&shard, trim_req(agg.clone(), 2)).await, Ok(ClientResponse::TrimStart(_))));
+            assert!(matches!(process(&shard, delete_req(agg.clone())).await, Ok(ClientResponse::Delete(_))));
+
+            let entries = shard.tail_shard(tail_req(0, u32::MAX, None)).await.unwrap().entries;
+            assert!(
+                matches!(
+                    &entries[..],
+                    [
+                        TailEntry { kind: TailEntryKind::Events { .. }, .. },
+                        TailEntry { kind: TailEntryKind::Events { .. }, .. },
+                        TailEntry { kind: TailEntryKind::Trim(MetablockSoftTrim { keep_from_aggregate_version: 2, .. }), .. },
+                        TailEntry { kind: TailEntryKind::Delete(MetablockSoftDelete { .. }), .. },
+                    ]
+                ),
+                "{entries:?}"
+            );
+            assert!(entries.iter().all(|e| e.server_timestamp > 0), "server_timestamp comes from the metablock");
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn tail_filters_by_org() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            for agg in [key(1, 1, 1), key(2, 1, 1), key(1, 1, 2), key(2, 1, 2), key(1, 1, 3)] {
+                write_ok(&shard, write_req(agg, events(1))).await;
+            }
+
+            let all = shard.tail_shard(tail_req(0, u32::MAX, None)).await.unwrap();
+            let org_2: Vec<u64> = all.entries.iter()
+                .filter(|e| matches!(&e.kind, TailEntryKind::Events { aggregate_key, .. } if aggregate_key.org_id == 2))
+                .map(|e| e.wal_seq)
+                .collect();
+            assert_eq!(org_2.len(), 2);
+
+            let filtered = shard.tail_shard(tail_req(0, u32::MAX, Some(HashSet::from([2])))).await.unwrap();
+            assert_eq!(wal_seqs(&filtered.entries), org_2);
+            assert_eq!(filtered.read_wal_seq, all.read_wal_seq, "read_wal_seq is the tip, past the filtered-out last entry");
+
+            shard.close().await;
+        });
+    }
+
+    /// A cursor on the last entry of a sealed segment must continue into the next one.
+    #[test]
+    fn tail_crosses_segment_rotation() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let config = InternalShardConfig {
+                shard_log_preallocate_bytes: 2 * HEADER_BLOCK_SIZE_BYTES as u64 + 512 * 1024,
+                ..test_config(&dir)
+            };
+            let shard = ShardWal::open(config, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader)
+                .await
+                .unwrap();
+            let agg = key(1, 1, 1);
+            let mut writes = 0u64;
+            while shard.log_segments_cache.active_log_id() < 3 && writes < 1000 {
+                writes += 1;
+                write_ok(&shard, write_req(agg.clone(), fat_event(writes))).await;
+            }
+            assert!(shard.log_segments_cache.active_log_id() >= 3, "scaffolding: two rotations");
+
+            let entries = tail_all(&shard, 1).await;
+            assert_eq!(wal_seqs(&entries), (1..=writes).collect::<Vec<u64>>(), "one contiguous ascending run");
+            for (version, entry) in (1..).zip(&entries) {
+                match &entry.kind {
+                    TailEntryKind::Events { batch, .. } => {
+                        assert_eq!(batch.aggregate_version, version);
+                        assert_eq!(batch.events[0].client_seq, version, "datablock must belong to its metablock");
+                    }
+                    other => panic!("expected Events, got {other:?}"),
+                }
+            }
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn tail_after_compaction_tolerates_gaps() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_compact_shard(&dir).await;
+            let agg_a = key(1, 1, 1);
+            let agg_b = key(1, 1, 2);
+
+            write_fat(&shard, &agg_a, 50).await;
+            write_ok(&shard, write_req(agg_b.clone(), events(3))).await;
+            assert!(matches!(process(&shard, delete_req(agg_a.clone())).await, Ok(ClientResponse::Delete(_))));
+            trigger_rotation(&shard).await;
+            assert!(shard.compact_oldest_eligible_segment().await.unwrap().is_some(), "scaffolding: segment 1 must compact");
+
+            let entries = tail_all(&shard, 1).await;
+            let seqs = wal_seqs(&entries);
+            assert!(seqs.windows(2).all(|w| w[0] < w[1]), "wal_seq must strictly ascend: {seqs:?}");
+            let tip = shard.log_segments_cache.get_latest_read_cursor_wal_seq();
+            assert!((seqs.len() as u64) < tip, "compaction must leave wal_seq gaps");
+            assert!(
+                !entries.iter().any(|e| matches!(&e.kind, TailEntryKind::Events { aggregate_key, .. } if *aggregate_key == agg_a)),
+                "deleted batches are compacted away"
+            );
+            assert!(entries.iter().any(|e| matches!(&e.kind, TailEntryKind::Delete(d) if d.aggregate_key == agg_a)));
+            assert!(entries.iter().any(|e| matches!(&e.kind, TailEntryKind::Events { aggregate_key, batch } if *aggregate_key == agg_b && batch.events.len() == 3)));
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn tail_cursor_ahead_of_tip_errors() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            write_ok(&shard, write_req(key(1, 1, 1), events(1))).await;
+            write_ok(&shard, write_req(key(1, 1, 2), events(1))).await;
+            let tip = shard.log_segments_cache.get_latest_read_cursor_wal_seq();
+
+            let at_tip = shard.tail_shard(tail_req(tip, u32::MAX, None)).await.unwrap();
+            assert!(at_tip.entries.is_empty());
+            assert_eq!(at_tip.read_wal_seq, tip);
+
+            let ahead = shard.tail_shard(tail_req(tip + 10, u32::MAX, None)).await;
+            assert!(matches!(ahead, Err(ShardTailError::TailCursorAhead { tip_wal_seq }) if tip_wal_seq == tip), "{ahead:?}");
+
+            shard.close().await;
+        });
+    }
+
+    /// Leader: a write that is fsynced but not yet replicated sits above the read
+    /// cursor and must not reach the tail until replication commits it.
+    #[test]
+    fn tail_hides_unreplicated_writes() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = ShardWal::open(
+                test_config(&dir),
+                ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 0 }, 500, now_ms() + 10_000),
+                StubReplicationClient,
+                StubS3Downloader,
+            ).await.unwrap();
+            let agg = key(1, 1, 1);
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+
+            let during: Rc<RefCell<Option<TailShardResponse>>> = Rc::default();
+            let observed = during.clone();
+            shard.set_after_fsync_hook_for_test(move |shard| Box::pin(async move {
+                *observed.borrow_mut() = Some(shard.tail_shard(tail_req(0, u32::MAX, None)).await.unwrap());
+            }));
+            write_ok(&shard, write_req(agg.clone(), events(1))).await;
+
+            let during = during.borrow_mut().take().expect("after-fsync hook must run");
+            assert_eq!(wal_seqs(&during.entries), [1], "fsynced, unreplicated write must be invisible");
+            assert_eq!(during.read_wal_seq, 1);
+
+            let after = shard.tail_shard(tail_req(0, u32::MAX, None)).await.unwrap();
+            assert_eq!(wal_seqs(&after.entries), [1, 2]);
 
             shard.close().await;
         });

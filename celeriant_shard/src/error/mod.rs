@@ -20,3 +20,4 @@ pub mod s3_catchup_error;
 pub mod send_heartbeat_error;
 pub mod shard_schema_error;
 pub mod compaction_error;
+pub mod shard_tail_error;

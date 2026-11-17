@@ -17,6 +17,7 @@ use celeriant_shard::error::{
     shard_listing_error::ShardListingError,
     shard_read_error::ShardReadError,
     shard_schema_error::ShardSchemaError,
+    shard_tail_error::ShardTailError,
     shard_trim_error::ShardTrimError,
     shard_write_error::ShardWriteError,
     watch_session_error::WatchSessionError,
@@ -58,6 +59,7 @@ fn shard_error_to_code(error: ShardError) -> (u32, String) {
         ShardError::AggregateDetails(e) => exists_error(e),
         ShardError::WatchRequestInvalid => (WATCH_REQUEST_INVALID, "{}".into()),
         ShardError::RegisterSchema(e) => register_schema_error(e),
+        ShardError::TailShard(e) => tail_shard_error(e),
     }
 }
 
@@ -235,6 +237,20 @@ fn listing_error(code: u32, e: ShardListingError) -> (u32, String) {
         ShardListingError::ListSemaphoreClosed => (
             code,
             r#"{"detail":"list semaphore closed"}"#.to_string(),
+        ),
+    }
+}
+
+fn tail_shard_error(e: ShardTailError) -> (u32, String) {
+    match e {
+        ShardTailError::ReadFromDisk(scan) => (
+            TAIL_SHARD_DISK_READ,
+            format!(r#"{{"detail":{}}}"#, json_string(&format!("{:?}", scan))),
+        ),
+        ShardTailError::FetchDatablock(e) => (TAIL_SHARD_FETCH_DATABLOCKS, fetch_datablock_message(e)),
+        ShardTailError::TailCursorAhead { tip_wal_seq } => (
+            TAIL_SHARD_CURSOR_AHEAD,
+            format!(r#"{{"tip_wal_seq":{}}}"#, tip_wal_seq),
         ),
     }
 }
@@ -445,6 +461,19 @@ mod tests {
                     e.error_message,
                     r#"{"requested":100,"max_aggregate_version":50}"#
                 );
+            }
+            _ => panic!("expected GenericError"),
+        }
+    }
+
+    #[test]
+    fn tail_cursor_ahead_response() {
+        let resp = shard_error_to_client_response(Some(7), ShardError::TailShard(ShardTailError::TailCursorAhead { tip_wal_seq: 42 }));
+        match resp {
+            ClientResponse::GenericError(e) => {
+                assert_eq!(e.error_code, TAIL_SHARD_CURSOR_AHEAD);
+                assert_eq!(e.error_message, r#"{"tip_wal_seq":42}"#);
+                assert_eq!(e.correlation_id, Some(7));
             }
             _ => panic!("expected GenericError"),
         }

@@ -77,6 +77,10 @@ pub const DELETE_CONFLICT_RESPONSE_TOO_LARGE: u32 = 4008;
 pub const LIST_ORGS_DISK_READ: u32 = 5000;
 pub const LIST_AGGREGATE_TYPES_DISK_READ: u32 = 5001;
 pub const LIST_AGGREGATES_DISK_READ: u32 = 5002;
+pub const TAIL_SHARD_DISK_READ: u32 = 5003;
+pub const TAIL_SHARD_FETCH_DATABLOCKS: u32 = 5004;
+/// `after_wal_seq` is past the shard's read cursor; the message carries `tip_wal_seq`.
+pub const TAIL_SHARD_CURSOR_AHEAD: u32 = 5005;
 
 // --- Replication batch errors: 6xxx ---
 pub const REPLICATION_BATCH_FSYNC: u32 = 6000;
