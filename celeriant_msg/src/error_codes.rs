@@ -12,6 +12,7 @@
 //   8xxx  Watch errors
 //   9xxx  Shard routing errors
 //  10xxx  Identity & authentication errors
+//  12xxx  Tail shard errors
 
 // --- Read errors: 1xxx ---
 pub const READ_UNAVAILABLE_VERSION: u32 = 1000;
@@ -77,10 +78,6 @@ pub const DELETE_CONFLICT_RESPONSE_TOO_LARGE: u32 = 4008;
 pub const LIST_ORGS_DISK_READ: u32 = 5000;
 pub const LIST_AGGREGATE_TYPES_DISK_READ: u32 = 5001;
 pub const LIST_AGGREGATES_DISK_READ: u32 = 5002;
-pub const TAIL_SHARD_DISK_READ: u32 = 5003;
-pub const TAIL_SHARD_FETCH_DATABLOCKS: u32 = 5004;
-/// `after_wal_seq` is past the shard's read cursor; the message carries `tip_wal_seq`.
-pub const TAIL_SHARD_CURSOR_AHEAD: u32 = 5005;
 
 // --- Replication batch errors: 6xxx ---
 pub const REPLICATION_BATCH_FSYNC: u32 = 6000;
@@ -117,3 +114,9 @@ pub const IDENTIFY_REQUIRED: u32 = 10004;
 pub const AUTH_REQUIRED: u32 = 10005;
 pub const AUTH_INVALID_KEY: u32 = 10006;
 pub const AUTH_INSUFFICIENT_PERMISSIONS: u32 = 10007;
+
+// --- Tail shard errors: 12xxx ---
+pub const TAIL_SHARD_DISK_READ: u32 = 12000;
+pub const TAIL_SHARD_FETCH_DATABLOCKS: u32 = 12001;
+/// `after_wal_seq` is past the shard's read cursor; the message carries `tip_wal_seq`.
+pub const TAIL_SHARD_CURSOR_AHEAD: u32 = 12002;

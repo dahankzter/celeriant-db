@@ -472,6 +472,7 @@ mod tests {
         match resp {
             ClientResponse::GenericError(e) => {
                 assert_eq!(e.error_code, TAIL_SHARD_CURSOR_AHEAD);
+                assert_eq!(e.error_code, 12002, "wire value; clients map it");
                 assert_eq!(e.error_message, r#"{"tip_wal_seq":42}"#);
                 assert_eq!(e.correlation_id, Some(7));
             }

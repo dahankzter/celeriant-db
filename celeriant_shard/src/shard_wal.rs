@@ -2120,7 +2120,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     /// except that one entry is always returned when available so the consumer progresses,
     /// and by `list_page_size` metablocks examined or `list_max_duration`.
     pub async fn tail_shard(&self, request: TailShardRequest) -> Result<TailShardResponse, ShardTailError> {
-        let tip = self.log_segments_cache.get_latest_read_cursor_wal_seq();
+        let tip = self.tail_tip().await?;
         if request.after_wal_seq > tip {
             return Err(ShardTailError::TailCursorAhead { tip_wal_seq: tip });
         }
@@ -2155,6 +2155,20 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             entries,
             read_wal_seq,
         })
+    }
+
+    /// Shard read cursor for `tail_shard`: the newest segment's read cursor, walking
+    /// back past segments that have none (just rotated). Unlike
+    /// `get_latest_read_cursor_wal_seq` it never falls back to a write cursor, which
+    /// could expose entries a rollback later rewrites under the same wal_seq.
+    async fn tail_tip(&self) -> Result<u64, ScanError<DiskFormatError>> {
+        for log_id in (1..=self.log_segments_cache.active_log_id()).rev() {
+            let read_wal_seq = self.log_segments_cache.get(log_id).await?.metadata.borrow().read.as_ref().map(|r| r.wal_seq);
+            if let Some(read_wal_seq) = read_wal_seq {
+                return Ok(read_wal_seq);
+            }
+        }
+        Ok(0)
     }
 
     /// Forward metablock scan for `tail_shard`, from the first segment holding a
@@ -14998,6 +15012,60 @@ use celeriant_wal::segment_summary::segment_aggregate_entry::SegmentAggregateEnt
 
             let after = shard.tail_shard(tail_req(0, u32::MAX, None)).await.unwrap();
             assert_eq!(wal_seqs(&after.entries), [1, 2]);
+
+            shard.close().await;
+        });
+    }
+
+    /// Leader right after a rotation: the active segment has no read cursor yet and its
+    /// predecessor is evicted, so `get_latest_read_cursor_wal_seq` falls back to the
+    /// active write cursor. The tail must still stop at the last replicated wal_seq.
+    #[test]
+    fn tail_tip_never_uses_write_cursor() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let config = InternalShardConfig {
+                shard_log_preallocate_bytes: 2 * HEADER_BLOCK_SIZE_BYTES as u64 + 512 * 1024,
+                ..test_config(&dir)
+            };
+            let shard = ShardWal::open(
+                config,
+                ValidatedNodeStatus::create_custom_status(NodeStatus::Leader { lease_epoch: 0 }, 500, now_ms() + 10_000),
+                StubReplicationClient,
+                StubS3Downloader,
+            ).await.unwrap();
+            let agg = key(1, 1, 1);
+            // ~200 KiB incompressible: the third write rotates the 512 KiB segment.
+            let big_event = |seed: u64| {
+                let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+                let bytes: Vec<u8> = (0..200 * 1024).map(|_| { state ^= state << 13; state ^= state >> 7; state ^= state << 17; state as u8 }).collect();
+                vec![DatablockAggregateEvent { client_seq: seed, event_type_major: 1, event_value: Arc::new(bytes), ..Default::default() }]
+            };
+
+            let observed: Rc<RefCell<Option<(u64, u64, TailShardResponse)>>> = Rc::default();
+            for seed in 1..=10 {
+                let last_replicated = shard.log_segments_cache.get_latest_read_cursor_wal_seq();
+                let slot = observed.clone();
+                shard.set_after_fsync_hook_for_test(move |shard| Box::pin(async move {
+                    let sealed_log_id = shard.log_segments_cache.active_log_id() - 1;
+                    if sealed_log_id == 0 {
+                        return;
+                    }
+                    shard.log_segments_cache.evict_from_lru(sealed_log_id);
+                    let helper_tip = shard.log_segments_cache.get_latest_read_cursor_wal_seq();
+                    let page = shard.tail_shard(tail_req(0, u32::MAX, None)).await.unwrap();
+                    *slot.borrow_mut() = Some((last_replicated, helper_tip, page));
+                }));
+                write_ok(&shard, write_req(agg.clone(), big_event(seed))).await;
+                if observed.borrow().is_some() {
+                    break;
+                }
+            }
+
+            let (last_replicated, helper_tip, page) = observed.borrow_mut().take().expect("scaffolding: a write must rotate");
+            assert!(helper_tip > last_replicated, "scaffolding: the shared helper must fall back to the write cursor");
+            assert_eq!(page.read_wal_seq, last_replicated, "tip must be the last replicated wal_seq");
+            assert_eq!(wal_seqs(&page.entries), (1..=last_replicated).collect::<Vec<u64>>(), "only replicated entries");
 
             shard.close().await;
         });
