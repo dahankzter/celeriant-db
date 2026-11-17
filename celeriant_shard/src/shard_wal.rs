@@ -2085,7 +2085,8 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
     /// WAL entries after `after_wal_seq`, ascending, up to the shard read cursor so a
     /// rollback can never retract one. Bounded by `min(max_bytes, max_response_size)`,
-    /// except that one entry is always returned when available so the consumer progresses.
+    /// except that one entry is always returned when available so the consumer progresses,
+    /// and by `list_page_size` metablocks examined or `list_max_duration`.
     pub async fn tail_shard(&self, request: TailShardRequest) -> Result<TailShardResponse, ShardTailError> {
         let tip = self.log_segments_cache.get_latest_read_cursor_wal_seq();
         if request.after_wal_seq > tip {
@@ -2093,9 +2094,11 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         }
 
         let mut kept: Vec<EventBatchFromLogSegmentFile> = Vec::new();
-        if request.after_wal_seq < tip {
-            self.collect_tail_metablocks(&request, tip, &mut kept).await?;
-        }
+        let read_wal_seq = if request.after_wal_seq < tip {
+            self.collect_tail_metablocks(&request, tip, &mut kept).await?
+        } else {
+            tip
+        };
         fetch_datablocks_for_metablocks(&mut kept, self.config.read_max_chunk_size, &self.log_segments_cache, &self.dict_codec).await?;
 
         let mut entries = Vec::with_capacity(kept.len());
@@ -2118,18 +2121,20 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             correlation_id: request.correlation_id,
             shard_id: request.shard_id,
             entries,
-            read_wal_seq: tip,
+            read_wal_seq,
         })
     }
 
     /// Forward metablock scan for `tail_shard`, from the first segment holding a
-    /// `wal_seq` past the cursor up to `tip`.
+    /// `wal_seq` past the cursor. Returns the highest `wal_seq` examined: every entry
+    /// up to it was kept or filtered out. That is `tip` once the scan reaches it.
     async fn collect_tail_metablocks(
         &self,
         request: &TailShardRequest,
         tip: u64,
         kept: &mut Vec<EventBatchFromLogSegmentFile>,
-    ) -> Result<(), ScanError<DiskFormatError>> {
+    ) -> Result<u64, ScanError<DiskFormatError>> {
+        let started = Instant::now();
         let after_wal_seq = request.after_wal_seq;
         let max_bytes = (request.max_bytes as u64).min(self.config.max_response_size);
         let active_log_id = self.log_segments_cache.active_log_id();
@@ -2148,8 +2153,11 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         }
 
         let mut accumulated_size = 0u64;
-        let mut done = false;
-        while !done && log_id <= active_log_id {
+        let mut examined = 0usize;
+        let mut examined_wal_seq = after_wal_seq;
+        // Some(read_wal_seq) once the scan stops.
+        let mut stopped_at: Option<u64> = None;
+        while stopped_at.is_none() && log_id <= active_log_id {
             let log_segment = self.log_segments_cache.get(log_id).await?;
             // Scan to the write cursor: a sealed segment can hold a committed tail above
             // its own read cursor (see fetch_catchup_entries). `tip` bounds visibility.
@@ -2170,23 +2178,29 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                             return Ok(false);
                         }
                         if wal_seq > tip {
-                            done = true;
+                            stopped_at = Some(tip);
+                            return Ok(true);
+                        }
+                        // Past the first entry, so every call advances read_wal_seq.
+                        if examined > 0 && (examined >= self.config.list_page_size || started.elapsed() >= self.config.list_max_duration) {
+                            stopped_at = Some(examined_wal_seq);
                             return Ok(true);
                         }
                         // Schema registrations carry no aggregate key and are not tailed.
-                        let Some(aggregate_key) = metablock_bytes::read_chain_aggregate_key(bytes) else {
-                            return Ok(false);
-                        };
-                        if request.orgs.as_ref().is_some_and(|orgs| !orgs.contains(&aggregate_key.org_id)) {
-                            return Ok(false);
+                        let wanted = metablock_bytes::read_chain_aggregate_key(bytes)
+                            .is_some_and(|key| request.orgs.as_ref().is_none_or(|orgs| orgs.contains(&key.org_id)));
+                        if wanted {
+                            let size_estimate = metablock_bytes::read_uncompressed_size(bytes).saturating_add(FIXED_BLOCK_SIZE_BYTES as u64);
+                            // Not examined: the consumer must see this entry on its next call.
+                            if !kept.is_empty() && accumulated_size.saturating_add(size_estimate) > max_bytes {
+                                stopped_at = Some(examined_wal_seq);
+                                return Ok(true);
+                            }
+                            accumulated_size += size_estimate;
+                            kept.push(EventBatchFromLogSegmentFile { log_id, metablock: deserialise_metablock(bytes)?, datablock: None });
                         }
-                        let size_estimate = metablock_bytes::read_uncompressed_size(bytes).saturating_add(FIXED_BLOCK_SIZE_BYTES as u64);
-                        if !kept.is_empty() && accumulated_size.saturating_add(size_estimate) > max_bytes {
-                            done = true;
-                            return Ok(true);
-                        }
-                        accumulated_size += size_estimate;
-                        kept.push(EventBatchFromLogSegmentFile { log_id, metablock: deserialise_metablock(bytes)?, datablock: None });
+                        examined += 1;
+                        examined_wal_seq = wal_seq;
                         Ok(false)
                     },
                 )
@@ -2200,7 +2214,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             log_id += 1;
         }
 
-        Ok(())
+        Ok(stopped_at.unwrap_or(tip))
     }
 
     /// Close the shard WAL, flushing any pending writes.
@@ -14594,16 +14608,18 @@ use celeriant_wal::segment_summary::segment_aggregate_entry::SegmentAggregateEnt
         entries.iter().map(|e| e.wal_seq).collect()
     }
 
-    /// Pages the tail from the beginning until a response comes back empty.
+    /// Pages the tail from the beginning the way a consumer does: advance to
+    /// `read_wal_seq` until it stops moving.
     async fn tail_all<R: ReplicationClient, D: S3Downloader>(shard: &ShardWal<R, D>, max_bytes: u32) -> Vec<TailEntry> {
         let mut entries: Vec<TailEntry> = Vec::new();
+        let mut after_wal_seq = 0;
         loop {
-            let after_wal_seq = entries.last().map_or(0, |e| e.wal_seq);
             let page = shard.tail_shard(tail_req(after_wal_seq, max_bytes, None)).await.unwrap();
-            if page.entries.is_empty() {
+            entries.extend(page.entries);
+            if page.read_wal_seq == after_wal_seq {
                 return entries;
             }
-            entries.extend(page.entries);
+            after_wal_seq = page.read_wal_seq;
         }
     }
 
@@ -14685,6 +14701,7 @@ use celeriant_wal::segment_summary::segment_aggregate_entry::SegmentAggregateEnt
                     break;
                 }
                 assert_eq!(page.entries.len(), 1, "an entry over max_bytes is still returned, alone");
+                assert_eq!(page.read_wal_seq, page.entries[0].wal_seq, "the entry cut by max_bytes is not examined");
                 paged.push(page.entries[0].wal_seq);
             }
             assert_eq!(paged, all, "paging must yield every entry exactly once");
@@ -14743,6 +14760,42 @@ use celeriant_wal::segment_summary::segment_aggregate_entry::SegmentAggregateEnt
             let filtered = shard.tail_shard(tail_req(0, u32::MAX, Some(HashSet::from([2])))).await.unwrap();
             assert_eq!(wal_seqs(&filtered.entries), org_2);
             assert_eq!(filtered.read_wal_seq, all.read_wal_seq, "read_wal_seq is the tip, past the filtered-out last entry");
+
+            shard.close().await;
+        });
+    }
+
+    /// A selective filter must not walk the whole WAL in one call: the scan stops at
+    /// the examined cap and `read_wal_seq` tells the consumer how far it got.
+    #[test]
+    fn tail_orgs_filter_scan_is_bounded() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let config = InternalShardConfig { list_page_size: 4, ..test_config(&dir) };
+            let shard = ShardWal::open(config, ValidatedNodeStatus::create_standalone(), StubReplicationClient, StubS3Downloader)
+                .await
+                .unwrap();
+            for id in 1..=10 {
+                write_ok(&shard, write_req(key(1, 1, id), events(1))).await;
+            }
+            let tip = shard.log_segments_cache.get_latest_read_cursor_wal_seq();
+            let orgs = Some(HashSet::from([2]));
+
+            let first = shard.tail_shard(tail_req(0, u32::MAX, orgs.clone())).await.unwrap();
+            assert!(first.entries.is_empty());
+            assert!(first.read_wal_seq > 0 && first.read_wal_seq < tip, "read_wal_seq {} must stop short of tip {tip}", first.read_wal_seq);
+
+            let mut after_wal_seq = first.read_wal_seq;
+            for _ in 0..10 {
+                if after_wal_seq == tip {
+                    break;
+                }
+                let page = shard.tail_shard(tail_req(after_wal_seq, u32::MAX, orgs.clone())).await.unwrap();
+                assert!(page.entries.is_empty());
+                assert!(page.read_wal_seq > after_wal_seq, "every call must make progress");
+                after_wal_seq = page.read_wal_seq;
+            }
+            assert_eq!(after_wal_seq, tip, "advancing to read_wal_seq must reach the tip");
 
             shard.close().await;
         });

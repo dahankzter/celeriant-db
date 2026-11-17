@@ -96,7 +96,9 @@ pub struct TailShardResponse {
     pub shard_id: u64,
     /// Ascending `wal_seq`.
     pub entries: Vec<TailEntry>,
-    /// Highest WAL sequence examined, including entries filtered out.
+    /// Highest WAL sequence examined: every entry up to it was returned or filtered
+    /// out, so the consumer may always advance its cursor here. Equals the shard read
+    /// cursor when the scan reached it, and is never above it.
     pub read_wal_seq: u64,
 }
 
