@@ -844,6 +844,7 @@ pub fn determine_client_shard(
         ClientRequest::ListOrgs(req) => validate_shard_id(req.shard_id, num_shards),
         ClientRequest::ListAggregateTypes(req) => validate_shard_id(req.shard_id, num_shards),
         ClientRequest::ListAggregates(req) => validate_shard_id(req.shard_id, num_shards),
+        ClientRequest::TailShard(req) => validate_shard_id(req.shard_id, num_shards),
         other => {
             let routing_id = config.routing_rule.routing_id_for_client_request(other);
             Ok(data_shard(routing_id, config))

@@ -90,6 +90,30 @@ pub struct ListAggregateTypesResponse {
     pub next_cursor: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct TailShardResponse {
+    pub correlation_id: Option<u128>,
+    pub shard_id: u64,
+    /// Ascending `wal_seq`.
+    pub entries: Vec<TailEntry>,
+    /// Highest WAL sequence examined, including entries filtered out.
+    pub read_wal_seq: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct TailEntry {
+    pub wal_seq: u64,
+    pub server_timestamp: u64,
+    pub kind: TailEntryKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub enum TailEntryKind {
+    Events { aggregate_key: celeriant_wal::aggregate_key::AggregateKey, batch: AggregateEventBatch },
+    Delete(celeriant_wal::metablocks::metablock_soft_delete::MetablockSoftDelete),
+    Trim(celeriant_wal::metablocks::metablock_soft_trim::MetablockSoftTrim),
+}
+
 /// Best-effort listing. An aggregate whose writes span a segment rotation can
 /// appear on more than one page; callers paginating to completion must dedup by
 /// aggregate key.

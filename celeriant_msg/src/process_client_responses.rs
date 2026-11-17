@@ -14,7 +14,7 @@ use crate::{
     response::responses::{
         AggregateDetailsResponse, DeleteResponse, ErrorResponse, ListAggregateTypesResponse,
         ListAggregatesResponse, ListOrgsResponse, ProtocolErrorResponse, ReadResponse,
-        RegisterSchemaResponse, TrimStartResponse, WatchResponse, WriteResponse,
+        RegisterSchemaResponse, TailShardResponse, TrimStartResponse, WatchResponse, WriteResponse,
         WriteConflictResponse, DeleteConflictResponse,
     },
 };
@@ -36,6 +36,7 @@ pub enum ClientResponseType {
     RegisterSchema = 12,
     WriteConflict = 13,
     DeleteConflict = 14,
+    TailShard = 15,
 }
 
 impl ClientResponseType {
@@ -55,6 +56,7 @@ impl ClientResponseType {
             12 => Ok(ClientResponseType::RegisterSchema),
             13 => Ok(ClientResponseType::WriteConflict),
             14 => Ok(ClientResponseType::DeleteConflict),
+            15 => Ok(ClientResponseType::TailShard),
             _ => Err(ReadWireDataError::UnknownMessageType(value)),
         }
     }
@@ -76,6 +78,7 @@ pub enum ClientResponse {
     RegisterSchema(RegisterSchemaResponse),
     WriteConflict(WriteConflictResponse),
     DeleteConflict(DeleteConflictResponse),
+    TailShard(TailShardResponse),
 }
 
 impl ClientResponse {
@@ -96,6 +99,7 @@ impl ClientResponse {
             ClientResponse::RegisterSchema(_) => ClientResponseType::RegisterSchema,
             ClientResponse::WriteConflict(_) => ClientResponseType::WriteConflict,
             ClientResponse::DeleteConflict(_) => ClientResponseType::DeleteConflict,
+            ClientResponse::TailShard(_) => ClientResponseType::TailShard,
         }
     }
 
@@ -114,6 +118,7 @@ impl ClientResponse {
             ClientResponse::RegisterSchema(r) => r.correlation_id,
             ClientResponse::WriteConflict(r) => r.correlation_id,
             ClientResponse::DeleteConflict(r) => r.correlation_id,
+            ClientResponse::TailShard(r) => r.correlation_id,
             ClientResponse::Watch(_) | ClientResponse::ProtocolError(_) => None,
         }
     }
@@ -176,6 +181,7 @@ impl ClientResponse {
             ClientResponseType::ListAggregates => variable_uncompressed!(ListAggregates),
             ClientResponseType::WriteConflict => variable_uncompressed!(WriteConflict),
             ClientResponseType::DeleteConflict => variable_uncompressed!(DeleteConflict),
+            ClientResponseType::TailShard => variable_uncompressed!(TailShard),
         })
     }
 
@@ -212,6 +218,7 @@ impl ClientResponse {
             ClientResponseType::ListOrgs => ClientResponse::ListOrgs(deserialise_versioned(body, version).map_err(mb)?),
             ClientResponseType::ListAggregateTypes => ClientResponse::ListAggregateTypes(deserialise_versioned(body, version).map_err(mb)?),
             ClientResponseType::ListAggregates => ClientResponse::ListAggregates(deserialise_versioned(body, version).map_err(mb)?),
+            ClientResponseType::TailShard => ClientResponse::TailShard(deserialise_versioned(body, version).map_err(mb)?),
         };
         Ok(result)
     }
@@ -246,6 +253,7 @@ impl ClientResponse {
             ClientResponse::ListOrgs(res) => write_variable_with_threshold(writer, res, response_type_id, client_has_dict, dict_codec, max_message_size, version).await,
             ClientResponse::ListAggregateTypes(res) => write_variable_with_threshold(writer, res, response_type_id, client_has_dict, dict_codec, max_message_size, version).await,
             ClientResponse::ListAggregates(res) => write_variable_with_threshold(writer, res, response_type_id, client_has_dict, dict_codec, max_message_size, version).await,
+            ClientResponse::TailShard(res) => write_variable_with_threshold(writer, res, response_type_id, client_has_dict, dict_codec, max_message_size, version).await,
         }
     }
 }
@@ -270,7 +278,8 @@ pub fn determine_compression_type(
         | ClientResponse::ListAggregateTypes(_)
         | ClientResponse::ListAggregates(_)
         | ClientResponse::WriteConflict(_)
-        | ClientResponse::DeleteConflict(_) => {}
+        | ClientResponse::DeleteConflict(_)
+        | ClientResponse::TailShard(_) => {}
     }
 
     compression_policy(payload_size, client_has_dict)
@@ -377,12 +386,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::response::responses::{AggregateConflict, AggregateListItem, OrgListItem};
+    use crate::response::responses::{AggregateConflict, AggregateListItem, OrgListItem, TailEntry, TailEntryKind, TailShardResponse};
     use celeriant_wire::network::wire_header::{PROTOCOL_VERSION_V4, PROTOCOL_VERSION_V5, WIRE_HEADER_SIZE};
     use futures_lite::{future::block_on, io::Cursor};
 
-    const COUNT: usize = 14;
-    const MAX_ID: u32 = 14;
+    const COUNT: usize = 15;
+    const MAX_ID: u32 = 15;
     const VERSIONS: [u32; 2] = [PROTOCOL_VERSION_V4, PROTOCOL_VERSION_V5];
 
     fn all_types() -> [ClientResponseType; COUNT] {
@@ -401,6 +410,7 @@ mod tests {
             ClientResponseType::RegisterSchema,
             ClientResponseType::WriteConflict,
             ClientResponseType::DeleteConflict,
+            ClientResponseType::TailShard,
         ]
     }
 
@@ -460,7 +470,93 @@ mod tests {
             ClientResponseType::RegisterSchema => ClientResponse::RegisterSchema(RegisterSchemaResponse {
                 correlation_id: Some(0x5555_6666_7777_8888),
             }),
+            ClientResponseType::TailShard => ClientResponse::TailShard(tail_shard_response()),
         }
+    }
+
+    fn tail_shard_response() -> TailShardResponse {
+        use crate::response::aggregate_event_batch::AggregateEventBatch;
+        use celeriant_wal::{
+            aggregate_key::AggregateKey, datablocks::datablock_aggregate_event::DatablockAggregateEvent,
+            metablocks::{metablock_soft_delete::MetablockSoftDelete, metablock_soft_trim::MetablockSoftTrim},
+        };
+        let key = AggregateKey::new(1, 2, 3);
+        TailShardResponse {
+            correlation_id: Some(0x6666_7777_8888_9999),
+            shard_id: 4,
+            read_wal_seq: 30,
+            entries: vec![
+                TailEntry {
+                    wal_seq: 10,
+                    server_timestamp: 1_700_000_000_001,
+                    kind: TailEntryKind::Events {
+                        aggregate_key: key.clone(),
+                        batch: AggregateEventBatch {
+                            aggregate_version: 7,
+                            client_id: 0xC0FFEE,
+                            user_id: Some(0xFEED),
+                            server_timestamp: 1_700_000_000_001,
+                            events: vec![DatablockAggregateEvent {
+                                client_seq: 1,
+                                event_seq: 10,
+                                event_id: Some(0xEEEE),
+                                event_timestamp: 1234,
+                                event_type_major: 42,
+                                event_type_minor: 1,
+                                event_value: std::sync::Arc::new(vec![1, 2, 3]),
+                                iv: None,
+                            }],
+                        },
+                    },
+                },
+                TailEntry {
+                    wal_seq: 20,
+                    server_timestamp: 1_700_000_000_002,
+                    kind: TailEntryKind::Delete(MetablockSoftDelete {
+                        aggregate_key: key.clone(),
+                        allow_recreate: true,
+                        allow_sequence_continuation: false,
+                        aggregate_version: 8,
+                        event_seq: 11,
+                        client_id: 0xC0FFEE,
+                        user_id: None,
+                    }),
+                },
+                TailEntry {
+                    wal_seq: 30,
+                    server_timestamp: 1_700_000_000_003,
+                    kind: TailEntryKind::Trim(MetablockSoftTrim {
+                        aggregate_key: key,
+                        keep_from_aggregate_version: 5,
+                        aggregate_version: 9,
+                        event_seq: 12,
+                        client_id: 0xC0FFEE,
+                        user_id: Some(0xFEED),
+                    }),
+                },
+            ],
+        }
+    }
+
+    fn tail_shard_roundtrip(version: u32) {
+        block_on(async {
+            let res = ClientResponse::TailShard(tail_shard_response());
+            let bytes = write_bytes(&res, version).await;
+            let parsed = read_back(&bytes).await;
+            assert_eq!(parsed.response_type(), ClientResponseType::TailShard);
+            assert_eq!(parsed.correlation_id(), Some(0x6666_7777_8888_9999));
+            assert_eq!(format!("{parsed:?}"), format!("{res:?}"));
+        });
+    }
+
+    #[test]
+    fn tail_shard_response_roundtrip_v4() {
+        tail_shard_roundtrip(PROTOCOL_VERSION_V4);
+    }
+
+    #[test]
+    fn tail_shard_response_roundtrip_v5() {
+        tail_shard_roundtrip(PROTOCOL_VERSION_V5);
     }
 
     fn is_variable_size(rt: ClientResponseType) -> bool {
@@ -473,6 +569,7 @@ mod tests {
                 | ClientResponseType::ListOrgs
                 | ClientResponseType::ListAggregateTypes
                 | ClientResponseType::ListAggregates
+                | ClientResponseType::TailShard
         )
     }
 
@@ -503,12 +600,12 @@ mod tests {
         for rt in all_types() {
             assert_eq!(ClientResponseType::from_u32(rt as u32).unwrap(), rt);
         }
-        for id in 1..=14 {
+        for id in 1..=15 {
             assert!(ClientResponseType::from_u32(id).is_ok(), "missing id {}", id);
         }
-        // IDs 15-99 reserved for future client responses
+        // IDs 16-99 reserved for future client responses
         // Cluster response IDs start at 100+
-        for id in 15..=20 {
+        for id in 16..=20 {
             assert!(ClientResponseType::from_u32(id).is_err(), "id {} should not parse as ClientResponseType yet", id);
         }
         assert!(ClientResponseType::from_u32(0).is_err());

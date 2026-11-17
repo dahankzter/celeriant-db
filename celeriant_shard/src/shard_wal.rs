@@ -598,6 +598,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
             ClientRequest::TrimStart(r) => ("trim", self.trim_start(r).await.map(ClientResponse::TrimStart).map_err(ShardError::TrimStart)),
             ClientRequest::AggregateDetails(r) => ("exists", self.exists(&r).await.map(ClientResponse::AggregateDetails).map_err(ShardError::AggregateDetails)),
             ClientRequest::Watch(_) => return Err(ShardError::WatchRequestInvalid),
+            ClientRequest::TailShard(_) => return Err(ShardError::WatchRequestInvalid),
             ClientRequest::ListOrgs(r) => ("list_orgs", self.list_orgs(r).await.map(ClientResponse::ListOrgs).map_err(ShardError::ListOrgs)),
             ClientRequest::ListAggregateTypes(r) => ("list_aggregate_types", self.list_aggregate_types(r).await.map(ClientResponse::ListAggregateTypes).map_err(ShardError::ListAggregateTypes)),
             ClientRequest::ListAggregates(r) => ("list_aggregates", self.list_aggregates(r).await.map(ClientResponse::ListAggregates).map_err(ShardError::ListAggregates)),

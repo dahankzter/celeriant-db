@@ -57,5 +57,6 @@ pub fn format_response(response: &ClientResponse) -> String {
         ClientResponse::ListAggregateTypes(r) => format!("ListAggregateTypes: {} types", r.aggregate_types.len()),
         ClientResponse::ListAggregates(r) => format!("ListAggregates: {} aggregates", r.aggregates.len()),
         ClientResponse::RegisterSchema(_) => "RegisterSchema: success".to_string(),
+        ClientResponse::TailShard(r) => format!("TailShard: {} entries, read to wal_seq {}", r.entries.len(), r.read_wal_seq),
     }
 }

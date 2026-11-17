@@ -12,7 +12,7 @@ use crate::{
     read_wire_data_error::ReadWireDataError,
     request::requests::{
         AggregateDetailsRequest, DeleteRequest, ListAggregateTypesRequest, ListAggregatesRequest,
-        ListOrgsRequest, ReadRequest, RegisterSchemaRequest, TrimStartRequest, WatchRequest, WriteRequest,
+        ListOrgsRequest, ReadRequest, RegisterSchemaRequest, TailShardRequest, TrimStartRequest, WatchRequest, WriteRequest,
     },
 };
 
@@ -29,6 +29,7 @@ pub enum ClientRequestType {
     ListAggregateTypes = 8,
     ListAggregates = 9,
     RegisterSchema = 10,
+    TailShard = 11,
 }
 
 impl ClientRequestType {
@@ -45,6 +46,7 @@ impl ClientRequestType {
             ClientRequestType::ListAggregateTypes => ClientResponseType::ListAggregateTypes,
             ClientRequestType::ListAggregates => ClientResponseType::ListAggregates,
             ClientRequestType::RegisterSchema => ClientResponseType::RegisterSchema,
+            ClientRequestType::TailShard => ClientResponseType::TailShard,
         }
     }
 
@@ -61,6 +63,7 @@ impl ClientRequestType {
             8 => Ok(ClientRequestType::ListAggregateTypes),
             9 => Ok(ClientRequestType::ListAggregates),
             10 => Ok(ClientRequestType::RegisterSchema),
+            11 => Ok(ClientRequestType::TailShard),
             _ => Err(ReadWireDataError::UnknownMessageType(value)),
         }
     }
@@ -78,6 +81,7 @@ pub enum ClientRequest {
     ListAggregateTypes(ListAggregateTypesRequest),
     ListAggregates(ListAggregatesRequest),
     RegisterSchema(RegisterSchemaRequest),
+    TailShard(TailShardRequest),
 }
 
 impl ClientRequest {
@@ -94,6 +98,7 @@ impl ClientRequest {
             ClientRequest::ListAggregateTypes(_) => ClientRequestType::ListAggregateTypes,
             ClientRequest::ListAggregates(_) => ClientRequestType::ListAggregates,
             ClientRequest::RegisterSchema(_) => ClientRequestType::RegisterSchema,
+            ClientRequest::TailShard(_) => ClientRequestType::TailShard,
         }
     }
 
@@ -110,6 +115,7 @@ impl ClientRequest {
             ClientRequest::ListAggregateTypes(req) => req.correlation_id,
             ClientRequest::ListAggregates(req) => req.correlation_id,
             ClientRequest::RegisterSchema(req) => req.correlation_id,
+            ClientRequest::TailShard(req) => req.correlation_id,
         }
     }
 
@@ -126,6 +132,7 @@ impl ClientRequest {
             ClientRequest::ListAggregateTypes(req) => &mut req.correlation_id,
             ClientRequest::ListAggregates(req) => &mut req.correlation_id,
             ClientRequest::RegisterSchema(req) => &mut req.correlation_id,
+            ClientRequest::TailShard(req) => &mut req.correlation_id,
         };
         slot.get_or_insert(id);
     }
@@ -201,6 +208,7 @@ impl ClientRequest {
             ClientRequestType::ListOrgs => fixed!(ListOrgs),
             ClientRequestType::ListAggregateTypes => fixed!(ListAggregateTypes),
             ClientRequestType::ListAggregates => fixed!(ListAggregates),
+            ClientRequestType::TailShard => fixed!(TailShard),
             ClientRequestType::Write => variable!(Write),
             ClientRequestType::RegisterSchema => variable!(RegisterSchema),
         })
@@ -225,6 +233,7 @@ impl ClientRequest {
             ClientRequest::ListOrgs(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
             ClientRequest::ListAggregateTypes(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
             ClientRequest::ListAggregates(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
+            ClientRequest::TailShard(req) => wire_header_write_fixed_size(writer, req, request_type_id, version).await,
             ClientRequest::Write(req) => wire_header_write_variable_size_uncompressed(writer, req, request_type_id, max_message_size, version).await,
             ClientRequest::RegisterSchema(req) => wire_header_write_variable_size_uncompressed(writer, req, request_type_id, max_message_size, version).await,
         }
@@ -246,6 +255,7 @@ impl ClientRequest {
             ClientRequest::ListOrgs(req) => serialise_heap_versioned(req, version),
             ClientRequest::ListAggregateTypes(req) => serialise_heap_versioned(req, version),
             ClientRequest::ListAggregates(req) => serialise_heap_versioned(req, version),
+            ClientRequest::TailShard(req) => serialise_heap_versioned(req, version),
             ClientRequest::Write(req) => serialise_heap_versioned(req, version),
             ClientRequest::RegisterSchema(req) => serialise_heap_versioned(req, version),
         }
@@ -260,7 +270,7 @@ mod tests {
         read_filters::ReadFilters,
         requests::{
             ListAggregateTypesRequest, ListAggregatesRequest, ListOrgsRequest,
-            SingleAggregateDelete, SingleAggregateWrite,
+            SingleAggregateDelete, SingleAggregateWrite, TailShardRequest,
         },
     };
     use celeriant_wal::{
@@ -272,8 +282,8 @@ mod tests {
     use futures_lite::{future::block_on, io::Cursor};
     use std::collections::{HashMap, HashSet};
 
-    const REQUEST_TYPE_COUNT: usize = 10;
-    const MAX_ID: u32 = 10;
+    const REQUEST_TYPE_COUNT: usize = 11;
+    const MAX_ID: u32 = 11;
     const VERSIONS: [u32; 2] = [PROTOCOL_VERSION_V4, PROTOCOL_VERSION_V5];
 
     fn all_types() -> [ClientRequestType; REQUEST_TYPE_COUNT] {
@@ -288,6 +298,7 @@ mod tests {
             ClientRequestType::ListAggregateTypes,
             ClientRequestType::ListAggregates,
             ClientRequestType::RegisterSchema,
+            ClientRequestType::TailShard,
         ]
     }
 
@@ -394,7 +405,36 @@ mod tests {
                 schema_type: 0,
                 schema: r#"{"type":"object","properties":{"name":{"type":"string"}}}"#.to_string(),
             }),
+            ClientRequestType::TailShard => ClientRequest::TailShard(TailShardRequest {
+                correlation_id: Some(0x7777_8888_9999_0000),
+                shard_id: 2,
+                after_wal_seq: 123_456,
+                max_bytes: 1 << 20,
+                wait_ms: 250,
+                orgs: Some(HashSet::from([0xABCD])),
+            }),
         }
+    }
+
+    fn tail_shard_roundtrip(version: u32) {
+        block_on(async {
+            assert_eq!(ClientRequestType::from_u32(11).unwrap(), ClientRequestType::TailShard);
+            let req = make_request(ClientRequestType::TailShard);
+            let bytes = write_bytes(&req, version, CompressionType::None).await;
+            let parsed = read_back(&bytes).await;
+            assert_eq!(parsed.request_type(), ClientRequestType::TailShard);
+            assert_eq!(format!("{parsed:?}"), format!("{req:?}"));
+        });
+    }
+
+    #[test]
+    fn tail_shard_request_roundtrip_v4() {
+        tail_shard_roundtrip(PROTOCOL_VERSION_V4);
+    }
+
+    #[test]
+    fn tail_shard_request_roundtrip_v5() {
+        tail_shard_roundtrip(PROTOCOL_VERSION_V5);
     }
 
     fn is_variable_size(rt: ClientRequestType) -> bool {
@@ -449,12 +489,12 @@ mod tests {
         for rt in all_types() {
             assert_eq!(ClientRequestType::from_u32(rt as u32).unwrap(), rt);
         }
-        for id in 1..=10 {
+        for id in 1..=11 {
             assert!(ClientRequestType::from_u32(id).is_ok(), "missing id {}", id);
         }
-        // IDs 11-99 are reserved for future client requests
+        // IDs 12-99 are reserved for future client requests
         // Cluster IDs start at 100+ (will be renumbered)
-        for id in 11..=20 {
+        for id in 12..=20 {
             assert!(ClientRequestType::from_u32(id).is_err(), "id {} should not parse as ClientRequestType yet", id);
         }
         assert!(ClientRequestType::from_u32(0).is_err());
@@ -660,6 +700,7 @@ mod tests {
             (ClientRequestType::ListAggregateTypes, ClientResponseType::ListAggregateTypes),
             (ClientRequestType::ListAggregates, ClientResponseType::ListAggregates),
             (ClientRequestType::RegisterSchema, ClientResponseType::RegisterSchema),
+            (ClientRequestType::TailShard, ClientResponseType::TailShard),
         ];
 
         let mut diverged = 0;
@@ -669,6 +710,6 @@ mod tests {
                 diverged += 1;
             }
         }
-        assert_eq!(diverged, 5, "Watch onwards must be where discriminant equality breaks");
+        assert_eq!(diverged, 6, "Watch onwards must be where discriminant equality breaks");
     }
 }

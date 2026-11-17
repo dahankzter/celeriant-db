@@ -28,6 +28,22 @@ pub struct ListAggregateTypesRequest {
     pub cursor: Option<u64>,
 }
 
+/// Read-only tail of one shard's WAL in `wal_seq` order. Blocks up to `wait_ms`
+/// when nothing past `after_wal_seq` is available.
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct TailShardRequest {
+    pub correlation_id: Option<u128>,
+    pub shard_id: u64,
+    /// WAL sequence to continue after (exclusive). 0 starts from the beginning.
+    pub after_wal_seq: u64,
+    /// Soft cap on the response payload size.
+    pub max_bytes: u32,
+    /// Long-poll budget when no entries are available.
+    pub wait_ms: u32,
+    /// Optional filter by org_id.
+    pub orgs: Option<HashSet<u128>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct ListAggregatesRequest {
     pub correlation_id: Option<u128>,
