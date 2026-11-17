@@ -217,15 +217,16 @@ use celeriant_msg::process_client_responses::ClientResponse;
 use celeriant_msg::request::read_filters::ReadFilters;
 use celeriant_msg::request::requests::{
     AggregateDetailsRequest, DeleteRequest, ListAggregateTypesRequest, ListAggregatesRequest,
-    ListOrgsRequest, ReadRequest, RegisterSchemaRequest, SingleAggregateWrite, TrimStartRequest,
-    WatchRequest, WriteRequest,
+    ListOrgsRequest, ReadRequest, RegisterSchemaRequest, SingleAggregateWrite, TailShardRequest,
+    TrimStartRequest, WatchRequest, WriteRequest,
 };
 use celeriant_msg::response::responses::{AggregateListItem, AggregateTypeListItem, OrgListItem};
 use celeriant_wal::aggregate_type_key::AggregateTypeKey;
 use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
 use celeriant_msg::response::aggregate_event_batch::AggregateEventBatch;
 use celeriant_msg::response::responses::{
-    AggregateDetailsResponse, DeleteResponse, ReadResponse, RegisterSchemaResponse, TrimStartResponse, WriteResponse,
+    AggregateDetailsResponse, DeleteResponse, ReadResponse, RegisterSchemaResponse, TailShardResponse, TrimStartResponse,
+    WriteResponse,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wire::network::wire_error::WireError;
@@ -996,6 +997,25 @@ impl CeleriantPool {
         request: AggregateDetailsRequest,
     ) -> Result<AggregateDetailsResponse, ClientError> {
         read_route!(self, c => c.aggregate_details(request.clone()))
+    }
+
+    /// Read one shard's WAL forward from `request.after_wal_seq` (exclusive).
+    ///
+    /// Only entries at or below the shard's read cursor are returned, so a tail never
+    /// shows a write that could still be rolled back. `read_wal_seq` in the response is
+    /// the highest sequence examined; advancing the cursor to it is always safe, even
+    /// when `entries` is empty. The caller owns the cursor. `wal_seq` values can have
+    /// legal gaps (compaction, filtered entries, schema registrations).
+    ///
+    /// `wait_ms` long-polls when nothing is available, capped by the server at 30 s.
+    /// Keep the pool's `request_timeout` above `wait_ms`, or the call fails with
+    /// `RequestTimeout` before the server answers.
+    ///
+    /// `TailError::CursorAhead { tip_wal_seq }` is retryable: this node is behind your
+    /// cursor (briefly after a rotation, or lagging). Back off and retry; it never means
+    /// the cursor should be reset.
+    pub async fn tail_shard(&self, request: TailShardRequest) -> Result<TailShardResponse, ClientError> {
+        read_route!(self, c => c.tail_shard(request.clone()))
     }
 
     pub async fn register_schema(

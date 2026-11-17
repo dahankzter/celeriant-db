@@ -147,6 +147,7 @@ async fn dispatch_test(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     match name {
         "occ_guards_standalone" => occ_guards::standalone().await,
         "occ_guards_distributed" => occ_guards::distributed().await,
+        "tail_shard_end_to_end" => tail_shard::tail_shard_end_to_end().await,
         "pagination_streams_whole_aggregate" => read_pagination::pagination_streams_whole_aggregate().await,
         "per_aggregate_order_across_shards" => per_aggregate_order_across_shards::per_aggregate_order_across_shards().await,
         "s3_outage_leader_keeps_serving" => s3_outage_leader_keeps_serving::s3_outage_leader_keeps_serving().await,

@@ -4,10 +4,11 @@ use celeriant_msg::process_client_requests::ClientRequest;
 use celeriant_msg::process_client_responses::ClientResponse;
 use celeriant_msg::request::requests::{
     AggregateDetailsRequest, DeleteRequest, ReadRequest, RegisterSchemaRequest, SingleAggregateWrite,
-    TrimStartRequest, WriteRequest,
+    TailShardRequest, TrimStartRequest, WriteRequest,
 };
 use celeriant_msg::response::responses::{
-    AggregateDetailsResponse, DeleteResponse, ReadResponse, RegisterSchemaResponse, TrimStartResponse, WriteResponse,
+    AggregateDetailsResponse, DeleteResponse, ReadResponse, RegisterSchemaResponse, TailShardResponse, TrimStartResponse,
+    WriteResponse,
 };
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::datablocks::datablock_aggregate_event::DatablockAggregateEvent;
@@ -71,6 +72,13 @@ impl CeleriantClient {
     ) -> Result<AggregateDetailsResponse, ClientError> {
         match self.send_owned(ClientRequest::AggregateDetails(request)).await? {
             ClientResponse::AggregateDetails(r) => Ok(r),
+            _ => Err(ClientError::ProtocolError),
+        }
+    }
+
+    pub async fn tail_shard(&mut self, request: TailShardRequest) -> Result<TailShardResponse, ClientError> {
+        match self.send_owned(ClientRequest::TailShard(request)).await? {
+            ClientResponse::TailShard(r) => Ok(r),
             _ => Err(ClientError::ProtocolError),
         }
     }

@@ -5,6 +5,7 @@ pub mod occ_guards;
 
 pub mod common;
 pub mod read_pagination;
+pub mod tail_shard;
 pub mod per_aggregate_order_across_shards;
 pub mod s3_outage_leader_keeps_serving;
 pub mod invariant_list_termination;

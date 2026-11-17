@@ -7,6 +7,12 @@ crates together.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `TailShard` request (id 11, response id 15) and `CeleriantPool::tail_shard`: a read-only, cursor-based forward scan of one shard's WAL with long-poll `wait_ms`, bounded by the read cursor so rollbackable writes are never shown. New client error `ServerError::Tail` with `TailError::CursorAhead { tip_wal_seq }` (retryable). See "Tailing a shard" in the guide.
+
 ## [0.3.0]
 
 Identity and API keys are enforced independently, and the dictionary handshake

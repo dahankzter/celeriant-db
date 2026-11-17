@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use celeriant_client_tokio::{ClientError, ServerError};
 
-pub const KEY_COUNT: usize = 29;
+pub const KEY_COUNT: usize = 30;
 
 /// The reported error classes. The discriminant is the index into
 /// `ErrorBreakdown`'s arrays, so `ALL` must stay in declaration order;
@@ -40,6 +40,7 @@ pub enum ErrorKey {
     ServerDelete,
     ServerTrim,
     ServerWatch,
+    ServerTail,
     ServerDetails,
     ServerAuth,
     ServerList,
@@ -74,6 +75,7 @@ impl ErrorKey {
         ErrorKey::ServerDelete,
         ErrorKey::ServerTrim,
         ErrorKey::ServerWatch,
+        ErrorKey::ServerTail,
         ErrorKey::ServerDetails,
         ErrorKey::ServerAuth,
         ErrorKey::ServerList,
@@ -114,6 +116,7 @@ impl ErrorKey {
                 ServerError::Delete { .. } => ErrorKey::ServerDelete,
                 ServerError::Trim { .. } => ErrorKey::ServerTrim,
                 ServerError::Watch { .. } => ErrorKey::ServerWatch,
+                ServerError::Tail { .. } => ErrorKey::ServerTail,
                 ServerError::Details { .. } => ErrorKey::ServerDetails,
                 ServerError::Auth { .. } => ErrorKey::ServerAuth,
                 ServerError::List { .. } => ErrorKey::ServerList,
@@ -149,6 +152,7 @@ impl ErrorKey {
             ErrorKey::ServerDelete => "Server(delete)",
             ErrorKey::ServerTrim => "Server(trim)",
             ErrorKey::ServerWatch => "Server(watch)",
+            ErrorKey::ServerTail => "Server(tail)",
             ErrorKey::ServerDetails => "Server(details)",
             ErrorKey::ServerAuth => "Server(auth)",
             ErrorKey::ServerList => "Server(list)",
@@ -240,7 +244,7 @@ pub fn print_error_summary(rows: &[ErrorKindCount]) {
 mod tests {
     use super::*;
     use celeriant_client_tokio::server_error::{
-        AuthError, DeleteError, DetailsError, ReadError, SchemaError, TrimError, WatchError, WriteError,
+        AuthError, DeleteError, DetailsError, ReadError, SchemaError, TailError, TrimError, WatchError, WriteError,
     };
     use celeriant_crypto::CryptoError;
     use celeriant_msg::read_wire_data_error::ReadWireDataError;
@@ -286,6 +290,7 @@ mod tests {
             (server(ServerError::Delete { kind: DeleteError::CacheError, error_message: String::new() }), "Server(delete)"),
             (server(ServerError::Trim { kind: TrimError::CacheError, error_message: String::new() }), "Server(trim)"),
             (server(ServerError::Watch { kind: WatchError::ReadIo, error_message: String::new() }), "Server(watch)"),
+            (server(ServerError::Tail { kind: TailError::DiskRead, error_message: String::new() }), "Server(tail)"),
             (server(ServerError::Details { kind: DetailsError::CacheError, error_message: String::new() }), "Server(details)"),
             (server(ServerError::Auth { kind: AuthError::InvalidKey, error_message: String::new() }), "Server(auth)"),
             (server(ServerError::List { error_code: 1, error_message: String::new() }), "Server(list)"),

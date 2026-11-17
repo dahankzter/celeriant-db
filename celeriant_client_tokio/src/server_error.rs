@@ -106,6 +106,16 @@ pub enum WatchError {
 }
 
 #[derive(Debug)]
+pub enum TailError {
+    DiskRead,
+    FetchDatablocks,
+    /// The consumer's cursor is past this node's read cursor. Retryable: the node
+    /// is behind (briefly after a rotation, or lagging). Never a reason to reset
+    /// the cursor.
+    CursorAhead { tip_wal_seq: Option<u64> },
+}
+
+#[derive(Debug)]
 pub enum DetailsError {
     CacheError,
     AggregateNotExists,
@@ -131,6 +141,7 @@ pub enum ServerError {
     Delete { kind: DeleteError, error_message: String },
     Trim { kind: TrimError, error_message: String },
     Watch { kind: WatchError, error_message: String },
+    Tail { kind: TailError, error_message: String },
     Details { kind: DetailsError, error_message: String },
     Auth { kind: AuthError, error_message: String },
     List { error_code: u32, error_message: String },
@@ -234,6 +245,13 @@ impl From<ErrorResponse> for ServerError {
             WATCH_READ_IO => ServerError::Watch { kind: WatchError::ReadIo, error_message: msg },
             WATCH_READ_SERIALIZATION => ServerError::Watch { kind: WatchError::ReadSerialization, error_message: msg },
             WATCH_READ_OTHER => ServerError::Watch { kind: WatchError::ReadOther, error_message: msg },
+
+            TAIL_SHARD_DISK_READ => ServerError::Tail { kind: TailError::DiskRead, error_message: msg },
+            TAIL_SHARD_FETCH_DATABLOCKS => ServerError::Tail { kind: TailError::FetchDatablocks, error_message: msg },
+            TAIL_SHARD_CURSOR_AHEAD => ServerError::Tail {
+                kind: TailError::CursorAhead { tip_wal_seq: parse_u64_field(&msg, "tip_wal_seq") },
+                error_message: msg,
+            },
 
             SHARD_ROUTING_NO_KEY | SHARD_ROUTING_MULTIPLE_SHARDS | SHARD_ROUTING_INCOMPATIBLE_FILTERS => {
                 ServerError::ShardRouting { error_code: code, error_message: msg }
@@ -347,6 +365,16 @@ impl std::fmt::Display for WatchError {
     }
 }
 
+impl std::fmt::Display for TailError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TailError::DiskRead => write!(f, "tail disk read"),
+            TailError::FetchDatablocks => write!(f, "tail fetch datablocks"),
+            TailError::CursorAhead { .. } => write!(f, "tail cursor ahead of node"),
+        }
+    }
+}
+
 impl std::fmt::Display for DetailsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -380,6 +408,7 @@ impl std::fmt::Display for ServerError {
             ServerError::Delete { kind, error_message } => write!(f, "delete error ({kind}): {error_message}"),
             ServerError::Trim { kind, error_message } => write!(f, "trim error ({kind}): {error_message}"),
             ServerError::Watch { kind, error_message } => write!(f, "watch error ({kind}): {error_message}"),
+            ServerError::Tail { kind, error_message } => write!(f, "tail error ({kind}): {error_message}"),
             ServerError::Details { kind, error_message } => write!(f, "details error ({kind}): {error_message}"),
             ServerError::Auth { kind, error_message } => write!(f, "auth error ({kind}): {error_message}"),
             ServerError::List { error_code, error_message } => write!(f, "list error ({error_code}): {error_message}"),

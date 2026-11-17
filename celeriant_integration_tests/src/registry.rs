@@ -111,6 +111,7 @@ pub fn all_tests() -> &'static [TestEntry] {
     &[
         TestEntry { name: "occ_guards_standalone", description: "Atomic guards, complete binary OCC, no partial state, wire version gating", estimated_secs: 30, categories: &[Correctness, Durability, Invariant], distributed: false },
         TestEntry { name: "occ_guards_distributed", description: "Atomic guards, complete OCC, replica payload parity and dual restart", estimated_secs: 90, categories: &[Correctness, Durability, Replication, Invariant], distributed: true },
+        TestEntry { name: "tail_shard_end_to_end", description: "TailShard pages every shard to the written events and long-polls for a new write", estimated_secs: 10, categories: &[Core, Correctness], distributed: false },
         TestEntry { name: "pagination_streams_whole_aggregate", description: "Reads page a large aggregate under the response size cap", estimated_secs: 10, categories: &[Core], distributed: false },
         TestEntry { name: "per_aggregate_order_across_shards", description: "Concurrent writers keep per-aggregate order and payloads across shards", estimated_secs: 25, categories: &[Correctness, Invariant], distributed: false },
         TestEntry { name: "s3_outage_leader_keeps_serving", description: "Leader keeps serving through an S3 outage longer than its lease", estimated_secs: 90, categories: &[Replication, Edge], distributed: true },
