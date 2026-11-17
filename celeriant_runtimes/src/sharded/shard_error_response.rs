@@ -252,6 +252,10 @@ fn tail_shard_error(e: ShardTailError) -> (u32, String) {
             TAIL_SHARD_CURSOR_AHEAD,
             format!(r#"{{"tip_wal_seq":{}}}"#, tip_wal_seq),
         ),
+        ShardTailError::SemaphoreClosed => (
+            TAIL_SHARD_SEMAPHORE_CLOSED,
+            r#"{"detail":"list semaphore closed"}"#.to_string(),
+        ),
     }
 }
 

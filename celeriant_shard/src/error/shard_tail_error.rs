@@ -9,6 +9,7 @@ pub enum ShardTailError {
     FetchDatablock(FetchDatablockError),
     /// The cursor is past the shard's read cursor, e.g. after a diverged node truncated.
     TailCursorAhead { tip_wal_seq: u64 },
+    SemaphoreClosed,
 }
 
 impl ShardTailError {
@@ -17,6 +18,7 @@ impl ShardTailError {
             Self::ReadFromDisk(_) => "read_from_disk_error",
             Self::FetchDatablock(_) => "fetch_datablocks_error",
             Self::TailCursorAhead { .. } => "tail_cursor_ahead",
+            Self::SemaphoreClosed => "list_semaphore_closed",
         }
     }
 }

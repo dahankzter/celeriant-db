@@ -113,6 +113,7 @@ pub enum TailError {
     /// is behind (briefly after a rotation, or lagging). Never a reason to reset
     /// the cursor.
     CursorAhead { tip_wal_seq: Option<u64> },
+    SemaphoreClosed,
 }
 
 #[derive(Debug)]
@@ -252,6 +253,7 @@ impl From<ErrorResponse> for ServerError {
                 kind: TailError::CursorAhead { tip_wal_seq: parse_u64_field(&msg, "tip_wal_seq") },
                 error_message: msg,
             },
+            TAIL_SHARD_SEMAPHORE_CLOSED => ServerError::Tail { kind: TailError::SemaphoreClosed, error_message: msg },
 
             SHARD_ROUTING_NO_KEY | SHARD_ROUTING_MULTIPLE_SHARDS | SHARD_ROUTING_INCOMPATIBLE_FILTERS => {
                 ServerError::ShardRouting { error_code: code, error_message: msg }
@@ -371,6 +373,7 @@ impl std::fmt::Display for TailError {
             TailError::DiskRead => write!(f, "tail disk read"),
             TailError::FetchDatablocks => write!(f, "tail fetch datablocks"),
             TailError::CursorAhead { .. } => write!(f, "tail cursor ahead of node"),
+            TailError::SemaphoreClosed => write!(f, "tail semaphore closed"),
         }
     }
 }

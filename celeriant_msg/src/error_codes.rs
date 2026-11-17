@@ -120,3 +120,4 @@ pub const TAIL_SHARD_DISK_READ: u32 = 12000;
 pub const TAIL_SHARD_FETCH_DATABLOCKS: u32 = 12001;
 /// `after_wal_seq` is past the shard's read cursor; the message carries `tip_wal_seq`.
 pub const TAIL_SHARD_CURSOR_AHEAD: u32 = 12002;
+pub const TAIL_SHARD_SEMAPHORE_CLOSED: u32 = 12003;

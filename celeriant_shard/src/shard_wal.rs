@@ -2157,8 +2157,12 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         }
     }
 
-    /// One non-waiting `tail_shard` pass.
+    /// One non-waiting `tail_shard` pass. Shares `list_semaphore` with listings: both
+    /// scan the WAL and buffer an unbudgeted response.
     async fn tail_scan(&self, request: &TailShardRequest) -> Result<TailShardResponse, ShardTailError> {
+        let _permit = self.list_semaphore.acquire_permit(1).await
+            .map_err(|_| ShardTailError::SemaphoreClosed)?;
+
         let tip = self.tail_tip().await?;
         if request.after_wal_seq > tip {
             return Err(ShardTailError::TailCursorAhead { tip_wal_seq: tip });
