@@ -38,6 +38,16 @@ use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_rotating_log::reverse_metablock_scanner::{ReverseMetablockScanner, SegmentHint};
 use lru::LruCache;
 use std::num::NonZeroUsize;
+
+/// Server-side ceiling on a `TailShard` long-poll.
+const TAIL_WAIT_MAX_MS: u32 = 30_000;
+/// How often a waiting `TailShard` re-reads the in-memory tip.
+const TAIL_WAIT_POLL: Duration = Duration::from_millis(5);
+
+/// The long-poll budget for a requested `wait_ms`, capped at `TAIL_WAIT_MAX_MS`.
+fn tail_wait_budget(wait_ms: u32) -> Duration {
+    Duration::from_millis(wait_ms.min(TAIL_WAIT_MAX_MS) as u64)
+}
 use celeriant_wal::aggregate_client_key::{client_id_bloom_hash, AggregateClientKey};
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::aggregate_type_key::AggregateTypeKey;
@@ -2119,7 +2129,31 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
     /// rollback can never retract one. Bounded by `min(max_bytes, max_response_size)`,
     /// except that one entry is always returned when available so the consumer progresses,
     /// and by `list_page_size` metablocks examined or `list_max_duration`.
+    ///
+    /// When the scan finds nothing past the cursor and `wait_ms > 0` (capped at
+    /// `TAIL_WAIT_MAX_MS`), polls the tip every `TAIL_WAIT_POLL` until it moves or the
+    /// budget elapses, then scans once more. Nothing is held across the sleep.
     pub async fn tail_shard(&self, request: TailShardRequest) -> Result<TailShardResponse, ShardTailError> {
+        let response = self.tail_scan(&request).await?;
+        let budget = tail_wait_budget(request.wait_ms);
+        if budget.is_zero() || !response.entries.is_empty() || response.read_wal_seq != request.after_wal_seq {
+            return Ok(response);
+        }
+        let deadline = Instant::now() + budget;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(response);
+            }
+            glommio::timer::sleep(TAIL_WAIT_POLL.min(remaining)).await;
+            if self.tail_tip().await? > request.after_wal_seq {
+                return self.tail_scan(&request).await;
+            }
+        }
+    }
+
+    /// One non-waiting `tail_shard` pass.
+    async fn tail_scan(&self, request: &TailShardRequest) -> Result<TailShardResponse, ShardTailError> {
         let tip = self.tail_tip().await?;
         if request.after_wal_seq > tip {
             return Err(ShardTailError::TailCursorAhead { tip_wal_seq: tip });
@@ -2127,7 +2161,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
         let mut kept: Vec<EventBatchFromLogSegmentFile> = Vec::new();
         let read_wal_seq = if request.after_wal_seq < tip {
-            self.collect_tail_metablocks(&request, tip, &mut kept).await?
+            self.collect_tail_metablocks(request, tip, &mut kept).await?
         } else {
             tip
         };
@@ -15071,4 +15105,70 @@ use celeriant_wal::segment_summary::segment_aggregate_entry::SegmentAggregateEnt
         });
     }
 
+
+    #[test]
+    fn tail_wait_returns_when_write_lands() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = Rc::new(open_shard(&dir).await);
+            let writer = shard.clone();
+            let write = glommio::spawn_local(async move {
+                glommio::timer::sleep(Duration::from_millis(50)).await;
+                write_ok(&*writer, write_req(key(1, 1, 1), events(1))).await;
+            });
+
+            let started = Instant::now();
+            let request = TailShardRequest { wait_ms: 2000, ..tail_req(0, u32::MAX, None) };
+            let page = shard.tail_shard(request).await.unwrap();
+            assert!(started.elapsed() < Duration::from_secs(1), "woke late: {:?}", started.elapsed());
+            assert_eq!(wal_seqs(&page.entries), vec![1]);
+            assert_eq!(page.read_wal_seq, 1);
+
+            write.await;
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn tail_wait_times_out_empty() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+
+            let started = Instant::now();
+            let request = TailShardRequest { wait_ms: 100, ..tail_req(0, u32::MAX, None) };
+            let page = shard.tail_shard(request).await.unwrap();
+            let elapsed = started.elapsed();
+            assert!(page.entries.is_empty());
+            assert_eq!(page.read_wal_seq, 0);
+            assert!(elapsed >= Duration::from_millis(100) && elapsed < Duration::from_millis(200), "elapsed {elapsed:?}");
+
+            shard.close().await;
+        });
+    }
+
+    #[test]
+    fn tail_wait_is_capped() {
+        assert_eq!(tail_wait_budget(0), Duration::ZERO);
+        assert_eq!(tail_wait_budget(100), Duration::from_millis(100));
+        assert_eq!(tail_wait_budget(u32::MAX), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn tail_wait_skipped_when_filter_advances_cursor() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            write_ok(&shard, write_req(key(1, 1, 1), events(1))).await;
+
+            let started = Instant::now();
+            let request = TailShardRequest { wait_ms: 2000, ..tail_req(0, u32::MAX, Some(HashSet::from([99]))) };
+            let page = shard.tail_shard(request).await.unwrap();
+            assert!(started.elapsed() < Duration::from_millis(500));
+            assert!(page.entries.is_empty());
+            assert_eq!(page.read_wal_seq, 1);
+
+            shard.close().await;
+        });
+    }
 }
