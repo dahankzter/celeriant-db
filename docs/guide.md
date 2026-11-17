@@ -490,7 +490,7 @@ loop {
         Ok(r) => r,
         Err(ClientError::Server(ServerError::Tail { kind: TailError::CursorAhead { .. }, .. })) => {
             tokio::time::sleep(Duration::from_millis(200)).await;
-            continue; // retryable: this node is behind your cursor
+            continue; // this node is behind your cursor; see CursorAhead below
         }
         Err(e) => return Err(e),
     };
@@ -507,7 +507,7 @@ loop {
 
 Each entry has a `wal_seq`, a `server_timestamp` and a `kind`: `Events` (an aggregate key plus one event batch), `Delete` or `Trim`. Entries arrive in ascending `wal_seq` within a shard. Shards are independent: tail each one you care about, with its own cursor.
 
-**Visibility.** A tail only returns entries at or below the shard's read cursor, so it never shows a write that could still be rolled back (for example an unreplicated write on a leader that then loses its lease). What you see is what reads see.
+**Visibility.** A tail only returns entries at or below the shard's read cursor, so it never shows a write that could still be rolled back (for example an unreplicated write on a leader that then loses its lease).
 
 **Gaps are legal.** `wal_seq` values are not dense. Compaction removes entries, a filter skips entries from other orgs, and schema registrations occupy sequence numbers without producing an entry. Never treat a gap as lost data.
 
@@ -515,13 +515,13 @@ Each entry has a `wal_seq`, a `server_timestamp` and a `kind`: `Events` (an aggr
 
 **Advancing to `read_wal_seq` is always safe.** It is the highest sequence the server examined: every entry up to it was either returned or filtered out. Move your cursor there after every response, including empty ones. It is never above the shard's read cursor.
 
-**`max_bytes` is a soft cap with a progress rule.** The response stops adding entries once the cap is reached, but always returns at least one entry when one is available, even if that entry alone is larger than `max_bytes`. A tiny `max_bytes` therefore still makes progress. The server also bounds the work per call (the list page size and list max duration settings), so a response can be short or empty while `read_wal_seq` has still advanced; call again from the new cursor.
+**`max_bytes` is a soft cap with a progress rule.** The server also caps it at its own `max_response_size`. The response stops adding entries once the cap is reached, but never cuts the first entry it would return, even if that entry alone is larger than `max_bytes`. A tiny `max_bytes` therefore still makes progress. One entry can be as large as the server's `max_request_size` (16 MiB by default) whatever `max_bytes` says, so the client's `max_response_size` must be at least that. The server also bounds the work per call (the list page size and list max duration settings), so a response can be short or empty while `read_wal_seq` has still advanced; call again from the new cursor.
 
 **Long-polling.** When nothing is available, the call waits up to `wait_ms` for new entries and then returns empty. The server caps `wait_ms` at 30 seconds. Keep the pool's `request_timeout` (default 30 s) above `wait_ms`, or the call fails with `RequestTimeout` first. A long-poll holds a pooled connection for its whole wait and is not cancelled promptly if you drop the call, so size `max_connections` for the number of shards you poll at once.
 
 **Filtering.** `orgs` restricts the entries returned to those orgs. A filtered consumer on a shard dominated by other orgs' traffic may get frequent empty responses whose `read_wal_seq` still advances. That is expected: the server is skipping entries you don't want, and each response moves your cursor forward. It is not a hot loop; the cursor, not the entry count, tells you whether progress was made.
 
-**`TailError::CursorAhead { tip_wal_seq }` is retryable.** It means the node answering is behind your cursor, which can happen briefly after a rotation or on a lagging node. Back off and retry. It never means your cursor is invalid and must be reset.
+**`TailError::CursorAhead { tip_wal_seq }`** means the node answering is behind your cursor. It is retryable while the node lags or after a failover: back off and retry. If it persists, or `tip_wal_seq` is far below your cursor, the log you followed is gone (the cluster was wiped or restored, you reached a different cluster, or a diverged node truncated) and the consumer must rebuild.
 
 ## Trimming and deleting
 

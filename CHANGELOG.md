@@ -9,9 +9,16 @@ and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Breaking
+
+- `TailShard` adds a variant to the exhaustive public enums `ServerError`
+  (`Tail`), `ClientRequest`, `ClientResponse`, `ClientRequestType` and
+  `ClientResponseType` (`TailShard`). A `match` on any of them without a
+  wildcard arm stops compiling.
+
 ### Added
 
-- `TailShard` request (id 11, response id 15) and `CeleriantPool::tail_shard`: a read-only, cursor-based forward scan of one shard's WAL with long-poll `wait_ms`, bounded by the read cursor so rollbackable writes are never shown. New client error `ServerError::Tail` with `TailError::CursorAhead { tip_wal_seq }` (retryable). See "Tailing a shard" in the guide.
+- `TailShard` request (id 11, response id 15) and `CeleriantPool::tail_shard`: a read-only, cursor-based forward scan of one shard's WAL with long-poll `wait_ms`, bounded by the read cursor so rollbackable writes are never shown. New client error `ServerError::Tail` (codes 12000-12003); `TailError::CursorAhead { tip_wal_seq }` is retryable while a node lags, and a persistent one means the consumer must rebuild. See "Tailing a shard" in the guide.
 
 ## [0.3.0]
 

@@ -109,9 +109,10 @@ pub enum WatchError {
 pub enum TailError {
     DiskRead,
     FetchDatablocks,
-    /// The consumer's cursor is past this node's read cursor. Retryable: the node
-    /// is behind (briefly after a rotation, or lagging). Never a reason to reset
-    /// the cursor.
+    /// The consumer's cursor is past this node's read cursor. Retryable while the
+    /// node lags or after a failover. If it persists, or `tip_wal_seq` is far below
+    /// the cursor, the log the consumer followed is gone (wiped, restored, another
+    /// cluster, or a diverged node truncated) and the consumer must rebuild.
     CursorAhead { tip_wal_seq: Option<u64> },
     SemaphoreClosed,
 }

@@ -1011,9 +1011,11 @@ impl CeleriantPool {
     /// Keep the pool's `request_timeout` above `wait_ms`, or the call fails with
     /// `RequestTimeout` before the server answers.
     ///
-    /// `TailError::CursorAhead { tip_wal_seq }` is retryable: this node is behind your
-    /// cursor (briefly after a rotation, or lagging). Back off and retry; it never means
-    /// the cursor should be reset.
+    /// `TailError::CursorAhead { tip_wal_seq }` means this node is behind your cursor.
+    /// It is retryable while the node lags or after a failover: back off and retry. If
+    /// it persists, or `tip_wal_seq` is far below your cursor, the log you followed is
+    /// gone (wiped, restored, another cluster, or a diverged node truncated) and the
+    /// consumer must rebuild.
     pub async fn tail_shard(&self, request: TailShardRequest) -> Result<TailShardResponse, ClientError> {
         read_route!(self, c => c.tail_shard(request.clone()))
     }

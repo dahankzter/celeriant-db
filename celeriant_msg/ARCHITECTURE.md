@@ -65,7 +65,7 @@ Message Classification:
 
 | Port | Enum | Request Types |
 |------|------|---------------|
-| Client port | `ClientRequest` | AggregateDetails, Read, Write, TrimStart, Delete, Watch, ListOrgs, ListAggregateTypes, ListAggregates, RegisterSchema |
+| Client port | `ClientRequest` | AggregateDetails, Read, Write, TrimStart, Delete, Watch, ListOrgs, ListAggregateTypes, ListAggregates, RegisterSchema, TailShard |
 | Replication port | `ClusterRequest` | ReplicationBatch, Heartbeat, KickFollower |
 
 Identify is handled on the client port before authentication, outside both enums.
@@ -86,6 +86,7 @@ Identify is handled on the client port before authentication, outside both enums
 | `ListAggregateTypesRequest` | 8 | Fixed | List aggregate types (optionally by org) |
 | `ListAggregatesRequest` | 9 | Fixed | List aggregates (optionally filtered) |
 | `RegisterSchemaRequest` | 10 | Variable | Register event schema (Json/Avro/Protobuf) |
+| `TailShardRequest` | 11 | Fixed | Read one shard's WAL forward from a cursor, with long-poll |
 
 ### Client Response Types
 
@@ -100,6 +101,7 @@ Identify is handled on the client port before authentication, outside both enums
 | `ListOrgsResponse` | 9 | Variable | Org list + pagination cursor |
 | `ListAggregateTypesResponse` | 10 | Variable | Aggregate type list + cursor |
 | `ListAggregatesResponse` | 11 | Variable | Aggregate list with metadata + cursor |
+| `TailShardResponse` | 15 | Variable | WAL entries in `wal_seq` order + `read_wal_seq` cursor |
 
 ### Cluster Request Types
 
@@ -153,6 +155,7 @@ All error codes are defined in `error_codes.rs`. No other file should define `u3
 | 9xxx | Shard routing | `SHARD_ROUTING_NO_KEY` (9000), `SHARD_ROUTING_MULTIPLE_SHARDS` (9001) |
 | 10xxx | Identity & auth | `IDENTIFY_REQUIRED` (10004), `AUTH_REQUIRED` (10005), `AUTH_INVALID_KEY` (10006) |
 | 11xxx | Server health | `SERVER_BUSY` (11000) |
+| 12xxx | Tail shard | `TAIL_SHARD_DISK_READ` (12000), `TAIL_SHARD_FETCH_DATABLOCKS` (12001), `TAIL_SHARD_CURSOR_AHEAD` (12002), `TAIL_SHARD_SEMAPHORE_CLOSED` (12003) |
 
 `ErrorResponse` methods: `is_not_leader()`, `is_identity_required()`, `is_server_busy()`, `parse_leader_address()`.
 

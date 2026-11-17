@@ -7,7 +7,10 @@ use crate::error::fetch_datablock_error::FetchDatablockError;
 pub enum ShardTailError {
     ReadFromDisk(ScanError<DiskFormatError>),
     FetchDatablock(FetchDatablockError),
-    /// The cursor is past the shard's read cursor, e.g. after a diverged node truncated.
+    /// The cursor is past this node's read cursor. Retryable while the node lags or
+    /// after a failover. If it persists, or `tip_wal_seq` is far below the cursor, the
+    /// log the consumer followed is gone (wiped, restored, another cluster, or a
+    /// diverged node truncated) and the consumer must rebuild.
     TailCursorAhead { tip_wal_seq: u64 },
     SemaphoreClosed,
 }

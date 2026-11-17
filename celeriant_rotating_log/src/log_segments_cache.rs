@@ -139,9 +139,6 @@ impl LogSegmentsCache {
 
     /// The `wal_seq` of the latest read cursor; same
     /// as `get_latest_read_cursor` but no clones (hurts with 256KB bloom)
-    // TODO: falls back to a write cursor when the active segment has no read cursor and
-    // its predecessor is evicted or has none, so `ShardWal::read` can briefly see
-    // unreplicated entries after a rotation. `ShardWal::tail_shard` walks segments instead.
     pub fn get_latest_read_cursor_wal_seq(&self) -> u64 {
         let (read_wal_seq, write_wal_seq, prev_log_id) = {
             let active_file = self.active_file.borrow();

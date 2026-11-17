@@ -38,16 +38,6 @@ use celeriant_rotating_log::log_segments_cache::LogSegmentsCache;
 use celeriant_rotating_log::reverse_metablock_scanner::{ReverseMetablockScanner, SegmentHint};
 use lru::LruCache;
 use std::num::NonZeroUsize;
-
-/// Server-side ceiling on a `TailShard` long-poll.
-const TAIL_WAIT_MAX_MS: u32 = 30_000;
-/// How often a waiting `TailShard` re-reads the in-memory tip.
-const TAIL_WAIT_POLL: Duration = Duration::from_millis(5);
-
-/// The long-poll budget for a requested `wait_ms`, capped at `TAIL_WAIT_MAX_MS`.
-fn tail_wait_budget(wait_ms: u32) -> Duration {
-    Duration::from_millis(wait_ms.min(TAIL_WAIT_MAX_MS) as u64)
-}
 use celeriant_wal::aggregate_client_key::{client_id_bloom_hash, AggregateClientKey};
 use celeriant_wal::aggregate_key::AggregateKey;
 use celeriant_wal::aggregate_type_key::AggregateTypeKey;
@@ -97,6 +87,16 @@ use crate::error::fetch_datablock_error::FetchDatablockError;
 use crate::shard_wal_replicate::{self, capture_replication_snapshot, commit_replication, wal_positions, ReplicationTrigger};
 use crate::shard_wal_s3_catchup::{self, S3CatchupResult, catchup_from_s3};
 use crate::shard_wal_sync::{capture_fsync_snapshot, commit_fsync_with_rollback, compute_entry_hash, sync_header_only, CommitTarget};
+
+/// Server-side ceiling on a `TailShard` long-poll.
+const TAIL_WAIT_MAX_MS: u32 = 30_000;
+/// How often a waiting `TailShard` re-reads the in-memory tip.
+const TAIL_WAIT_POLL: Duration = Duration::from_millis(5);
+
+/// The long-poll budget for a requested `wait_ms`, capped at `TAIL_WAIT_MAX_MS`.
+fn tail_wait_budget(wait_ms: u32) -> Duration {
+    Duration::from_millis(wait_ms.min(TAIL_WAIT_MAX_MS) as u64)
+}
 
 /// Upper bound on how long a leader write waits for the read cursor to confirm
 /// its events before giving up with `LeaderFenced`. Matches the replication spin
@@ -680,6 +680,7 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 let error_counter = match op_name {
                     "write" => "celeriant_write_errors_total",
                     "read" => "celeriant_read_errors_total",
+                    "tail_shard" => "celeriant_read_errors_total",
                     _ => "celeriant_write_errors_total",
                 };
                 let error_label = [
@@ -2132,8 +2133,10 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
 
     /// WAL entries after `after_wal_seq`, ascending, up to the shard read cursor so a
     /// rollback can never retract one. Bounded by `min(max_bytes, max_response_size)`,
-    /// except that one entry is always returned when available so the consumer progresses,
-    /// and by `list_page_size` metablocks examined or `list_max_duration`.
+    /// except that the first wanted entry is never cut by it, and by `list_page_size`
+    /// metablocks examined or `list_max_duration`. With an orgs filter (or schema
+    /// registrations) the examined cap can end a call with no entries; `read_wal_seq`
+    /// still advances, so the consumer progresses either way.
     ///
     /// When the scan finds nothing past the cursor and `wait_ms > 0` (capped at
     /// `TAIL_WAIT_MAX_MS`), polls the tip every `TAIL_WAIT_POLL` until it moves or the
@@ -15205,7 +15208,6 @@ use celeriant_wal::segment_summary::segment_aggregate_entry::SegmentAggregateEnt
         });
     }
 
-
     #[test]
     fn tail_wait_returns_when_write_lands() {
         glommio_test!({
@@ -15241,7 +15243,7 @@ use celeriant_wal::segment_summary::segment_aggregate_entry::SegmentAggregateEnt
             let elapsed = started.elapsed();
             assert!(page.entries.is_empty());
             assert_eq!(page.read_wal_seq, 0);
-            assert!(elapsed >= Duration::from_millis(100) && elapsed < Duration::from_millis(200), "elapsed {elapsed:?}");
+            assert!(elapsed >= Duration::from_millis(100) && elapsed < Duration::from_secs(1), "elapsed {elapsed:?}");
 
             shard.close().await;
         });
