@@ -93,6 +93,7 @@ use crate::replication_client::ReplicationClient;
 use crate::s3_downloader::S3Downloader;
 use crate::shard_wal_compact::{CompactionResult, SCAN_CHUNK_SIZE, compact_segment};
 use crate::error::compaction_error::CompactionError;
+use crate::error::fetch_datablock_error::FetchDatablockError;
 use crate::shard_wal_replicate::{self, capture_replication_snapshot, commit_replication, wal_positions, ReplicationTrigger};
 use crate::shard_wal_s3_catchup::{self, S3CatchupResult, catchup_from_s3};
 use crate::shard_wal_sync::{capture_fsync_snapshot, commit_fsync_with_rollback, compute_entry_hash, sync_header_only, CommitTarget};
@@ -610,18 +611,22 @@ async fn first_metablock_after(
 ) -> Result<u64, ScanError<DiskFormatError>> {
     let metablocks_start = HEADER_BLOCK_SIZE_BYTES as u64;
     let block_size = FIXED_BLOCK_SIZE_BYTES as u64;
+    debug_assert!(
+        metablocks_end >= metablocks_start && (metablocks_end - metablocks_start) % block_size == 0,
+        "metablocks_end {metablocks_end} must be a block boundary at or past the header"
+    );
     let (mut low, mut high) = (0, (metablocks_end - metablocks_start) / block_size);
     while low < high {
         let mid = low + (high - low) / 2;
         let pos = metablocks_start + mid * block_size;
-        let block = dma_file
+        let buf = dma_file
             .read_at(pos, FIXED_BLOCK_SIZE_BYTES)
             .await
             .map_err(|e| ScanError::Io { log_id, source: e.to_string() })?;
-        if block.len() < FIXED_BLOCK_SIZE_BYTES {
-            return Err(ScanError::ShortRead { log_id, pos, requested: FIXED_BLOCK_SIZE_BYTES, got: block.len() });
-        }
-        if metablock_bytes::read_wal_seq(&block) > after_wal_seq {
+        let Some(block) = buf.as_chunks::<FIXED_BLOCK_SIZE_BYTES>().0.first() else {
+            return Err(ScanError::ShortRead { log_id, pos, requested: FIXED_BLOCK_SIZE_BYTES, got: buf.len() });
+        };
+        if deserialise_metablock(block).map_err(ScanError::Visitor)?.wal_seq > after_wal_seq {
             high = mid;
         } else {
             low = mid + 1;
@@ -2168,11 +2173,17 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
         fetch_datablocks_for_metablocks(&mut kept, self.config.read_max_chunk_size, &self.log_segments_cache, &self.dict_codec).await?;
 
         let mut entries = Vec::with_capacity(kept.len());
-        for EventBatchFromLogSegmentFile { metablock, datablock, .. } in kept {
+        for EventBatchFromLogSegmentFile { log_id, metablock, datablock } in kept {
             let kind = match metablock.wal_metablock_type {
                 MetablockKind::EventBatchMetadata(ref event_batch) => {
+                    // Its wal_seq is already within read_wal_seq: skipping it would lose it for good.
                     let Some(batch) = datablock.as_ref().and_then(|d| AggregateEventBatch::from_wal(&metablock, d)) else {
-                        continue;
+                        return Err(ShardTailError::FetchDatablock(FetchDatablockError::DatablockError {
+                            log_id,
+                            wal_seq: metablock.wal_seq,
+                            source: DiskFormatError::DatablockExpected,
+                            is_inline: matches!(metablock.datablock, DatablockStorageKind::Inline(_)),
+                        }));
                     };
                     TailEntryKind::Events { aggregate_key: event_batch.aggregate_key.clone(), batch }
                 }
@@ -2263,7 +2274,10 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                 metablocks_end,
                 SCAN_CHUNK_SIZE,
                 |_pos, bytes| {
-                    let wal_seq = metablock_bytes::read_wal_seq(bytes);
+                    // CRC-checked before any decision: a corrupt wal_seq, kind or org must
+                    // fail the call, not move read_wal_seq past an entry unseen.
+                    let metablock = deserialise_metablock(bytes)?;
+                    let wal_seq = metablock.wal_seq;
                     if wal_seq <= after_wal_seq {
                         return Ok(false);
                     }
@@ -2276,18 +2290,23 @@ impl<R: ReplicationClient + 'static, D: S3Downloader + 'static> ShardWal<R, D> {
                         stopped_at = Some(examined_wal_seq);
                         return Ok(true);
                     }
-                    // Schema registrations carry no aggregate key and are not tailed.
-                    let wanted = metablock_bytes::read_chain_aggregate_key(bytes)
-                        .is_some_and(|key| request.orgs.as_ref().is_none_or(|orgs| orgs.contains(&key.org_id)));
+                    let org_id = match &metablock.wal_metablock_type {
+                        MetablockKind::EventBatchMetadata(event_batch) => Some(event_batch.aggregate_key.org_id),
+                        MetablockKind::SoftDelete(soft_delete) => Some(soft_delete.aggregate_key.org_id),
+                        MetablockKind::SoftTrim(soft_trim) => Some(soft_trim.aggregate_key.org_id),
+                        // Schema registrations carry no aggregate key and are not tailed.
+                        MetablockKind::SchemaRegistration(_) => None,
+                    };
+                    let wanted = org_id.is_some_and(|org_id| request.orgs.as_ref().is_none_or(|orgs| orgs.contains(&org_id)));
                     if wanted {
-                        let size_estimate = metablock_bytes::read_uncompressed_size(bytes).saturating_add(FIXED_BLOCK_SIZE_BYTES as u64);
+                        let size_estimate = metablock.uncompressed_size.saturating_add(FIXED_BLOCK_SIZE_BYTES as u64);
                         // Not examined: the consumer must see this entry on its next call.
                         if !kept.is_empty() && accumulated_size.saturating_add(size_estimate) > max_bytes {
                             stopped_at = Some(examined_wal_seq);
                             return Ok(true);
                         }
                         accumulated_size += size_estimate;
-                        kept.push(EventBatchFromLogSegmentFile { log_id, metablock: deserialise_metablock(bytes)?, datablock: None });
+                        kept.push(EventBatchFromLogSegmentFile { log_id, metablock, datablock: None });
                     }
                     examined += 1;
                     examined_wal_seq = wal_seq;
@@ -15013,6 +15032,83 @@ use celeriant_wal::segment_summary::segment_aggregate_entry::SegmentAggregateEnt
 
             let ahead = shard.tail_shard(tail_req(tip + 10, u32::MAX, None)).await;
             assert!(matches!(ahead, Err(ShardTailError::TailCursorAhead { tip_wal_seq }) if tip_wal_seq == tip), "{ahead:?}");
+
+            shard.close().await;
+        });
+    }
+
+    /// Overwrites one block of a segment file behind the open shard's back.
+    fn write_block_at<R: ReplicationClient, D: S3Downloader>(shard: &ShardWal<R, D>, log_id: u64, pos: u64, block: &[u8]) {
+        use std::os::unix::fs::FileExt;
+        let path = shard.log_segments_cache.shard_dir().join(format!("log_{log_id}.wal"));
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.write_all_at(block, pos).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    /// An event batch without its datablock fails the call rather than vanishing
+    /// while `read_wal_seq` moves past it.
+    #[test]
+    fn tail_errors_on_event_batch_without_datablock() {
+        glommio_test!({
+            use celeriant_wal::constants::WIRE_VERSION_WAL_METABLOCK;
+
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            for id in 1..=3 {
+                write_ok(&shard, write_req(key(1, 1, id), events(1))).await;
+            }
+            let pos = HEADER_BLOCK_SIZE_BYTES as u64 + FIXED_BLOCK_SIZE_BYTES as u64;
+            let mut metablock = deserialise_metablock(&read_block_at(&shard, 1, pos).await).unwrap();
+            assert_eq!(metablock.wal_seq, 2, "scaffolding: the second block holds wal_seq 2");
+            metablock.datablock = DatablockStorageKind::None;
+            let mut block = [0u8; FIXED_BLOCK_SIZE_BYTES];
+            versioned_block::serialize_versioned_message(&metablock, WIRE_VERSION_WAL_METABLOCK, &mut block).unwrap();
+            write_block_at(&shard, 1, pos, &block);
+
+            let result = shard.tail_shard(tail_req(0, u32::MAX, None)).await.map(|r| (wal_seqs(&r.entries), r.read_wal_seq));
+            assert!(
+                matches!(
+                    result,
+                    Err(ShardTailError::FetchDatablock(FetchDatablockError::DatablockError {
+                        log_id: 1,
+                        wal_seq: 2,
+                        source: DiskFormatError::DatablockExpected,
+                        ..
+                    }))
+                ),
+                "{result:?}"
+            );
+
+            shard.close().await;
+        });
+    }
+
+    /// A metablock failing its CRC fails the call: kind, org and wal_seq all come
+    /// from it, so trusting the raw bytes could skip a real entry.
+    #[test]
+    fn tail_errors_on_corrupt_metablock() {
+        glommio_test!({
+            let (_tmp, dir) = test_dir();
+            let shard = open_shard(&dir).await;
+            for id in 1..=3 {
+                write_ok(&shard, write_req(key(1, 1, id), events(1))).await;
+            }
+            let pos = HEADER_BLOCK_SIZE_BYTES as u64 + 2 * FIXED_BLOCK_SIZE_BYTES as u64;
+            let mut block = read_block_at(&shard, 1, pos).await;
+            assert_eq!(metablock_bytes::read_wal_seq(&block), 3, "scaffolding: the third block holds wal_seq 3");
+            // Event batch (0) becomes schema registration (1); the CRC is left stale.
+            block[versioned_block::HEADER_SIZE + Metablock::OFFSET_WAL_METABLOCK_TYPE] ^= 1;
+            write_block_at(&shard, 1, pos, &block);
+
+            // Cursor 0 reaches the block in the forward scan; cursor 2 in the start-block search.
+            for cursor in [0, 2] {
+                let result = shard.tail_shard(tail_req(cursor, u32::MAX, None)).await.map(|r| (wal_seqs(&r.entries), r.read_wal_seq));
+                assert!(
+                    matches!(result, Err(ShardTailError::ReadFromDisk(ScanError::Visitor(DiskFormatError::ChecksumMismatch { .. })))),
+                    "cursor {cursor}: {result:?}"
+                );
+            }
 
             shard.close().await;
         });
